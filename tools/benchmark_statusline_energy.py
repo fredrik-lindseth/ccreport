@@ -42,10 +42,12 @@ import os
 import re
 import shutil
 import signal
+import socket
 import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Iterable
 from pathlib import Path
@@ -57,6 +59,10 @@ HERE = Path(__file__).resolve().parent
 # gets the module's bytecode cached) are part of the per-render cost measured
 # here. `python -m ccreport.statusline` would skip both.
 STATUSLINE = HERE.parent / "bin" / "statusline-command_x.sh"
+SRC = HERE.parent / "src"
+_VENV_PY = HERE.parent / ".venv" / "bin" / "python"
+PY = _VENV_PY if _VENV_PY.exists() else Path(sys.executable)
+"""The interpreter the wrapper picks, for the one seed the bench home needs."""
 
 # Rough per-active-core power bracket for Apple Silicon (E-core .. P-core)
 # used to convert CPU-seconds to joules when the direct measurement is
@@ -115,6 +121,7 @@ token is in theirs and in no other process on the machine.
 
 CHILD_TIMEOUT_S = 25.0   # give up waiting for a run's detached children to exit
 CHILD_SETTLE_S = 2.0     # after the render exits, wait this long for a late spawn
+PUSH_HOLD_S = 1.0        # how long the bench's push target keeps the connection open
 
 _ENV_TOKEN = re.compile(r" [A-Z_][A-Z0-9_]*=")
 
@@ -189,6 +196,74 @@ def _describe(pid: int, tag: str = "") -> tuple[str, bool]:
     return (raw[: cut.start()] if cut else raw), f"{BENCH_RUN_ENV}={tag}" in raw
 
 
+class _HoldListener:
+    """The push target: accepts, holds the connection PUSH_HOLD_S, closes it.
+
+    Not a byte is read or sent, so nothing arrives anywhere; the point is the
+    child's lifetime. Against a closed port the push lived 50-70 ms on an idle
+    machine, which is one ps sample on a quiet one and none at all beside a
+    parallel test run, where every new session leader costs the sampling loop
+    a ps call of its own. A second on the wire is seen on any cadence.
+    """
+
+    def __init__(self) -> None:
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.sock.settimeout(0.1)
+        self.port: int = self.sock.getsockname()[1]
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        held: list[tuple[float, socket.socket]] = []
+        while not self._stop.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except TimeoutError:
+                pass
+            except OSError:
+                break
+            else:
+                held.append((time.monotonic() + PUSH_HOLD_S, conn))
+            now = time.monotonic()
+            for due, conn in [h for h in held if h[0] <= now]:
+                conn.close()
+                held.remove((due, conn))
+        for _due, conn in held:
+            conn.close()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+        self.sock.close()
+
+
+_bench_listeners: dict[str, _HoldListener] = {}
+"""The listener behind each live bench home, closed by _discard_bench_home."""
+
+SEED_SRC = """
+import sys; sys.path.insert(0, sys.argv.pop(1))
+from ccreport import cache_db
+cache_db.record_account_event({"accountUuid": "energy-bench", "emailAddress": "bench@example.invalid"})
+"""
+"""Run in the bench HOME: one account capture, so the push has a pull to post."""
+
+
+def _bench_env(home: str) -> dict[str, str]:
+    """HOME and both XDG roots under *home*: the cache and push.toml paths
+    derive from them, and an XDG variable exported in the developer's shell
+    would otherwise point a bench render at the database the machine reports
+    from."""
+    return dict(
+        os.environ, HOME=home,
+        XDG_DATA_HOME=str(Path(home, ".local", "share")),
+        XDG_CONFIG_HOME=str(Path(home, ".config")),
+    )
+
+
 def _bench_home() -> str:
     """A private HOME with the interval gates cold, and a push target.
 
@@ -196,15 +271,34 @@ def _bench_home() -> str:
     push_next_at in ~/.local/share/ccreport/cache.db, update_checked_at beside them,
     and ~/.config/ccreport/push.toml, whose absence stops the push before any
     gate is read. A HOME of its own resets them all for one render without
-    writing anything into the cache the machine actually reports from. The
-    server URL is a closed port: the push has to start to be counted, and
-    nothing here wants it to arrive.
+    writing anything into the cache the machine actually reports from.
+
+    The server is a _HoldListener. A push with nothing to send makes no request
+    at all -- no files, no samples, and the pull-only batch needs a signed-in
+    account -- so the cache is seeded with one account capture first. That row
+    is the only thing in it: every interval gate stays cold.
     """
     home = tempfile.mkdtemp(prefix="ccreport-bench-home-")
+    listener = _HoldListener()
+    _bench_listeners[home] = listener
     cfg = Path(home, ".config", "ccreport")
     cfg.mkdir(parents=True)
-    (cfg / "push.toml").write_text('[server."http://127.0.0.1:9"]\ntoken = "energy-bench"\n')
+    (cfg / "push.toml").write_text(
+        f'[server."http://127.0.0.1:{listener.port}"]\ntoken = "energy-bench"\n'
+    )
+    subprocess.run(
+        [str(PY), "-c", SEED_SRC, str(SRC)], env=_bench_env(home), check=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
     return home
+
+
+def _discard_bench_home(home: str) -> None:
+    """Stop the home's push target and remove the directory."""
+    listener = _bench_listeners.pop(home, None)
+    if listener is not None:
+        listener.close()
+    shutil.rmtree(home, ignore_errors=True)
 
 
 def _detached_run(tag: str) -> dict:
@@ -224,7 +318,7 @@ def _detached_run(tag: str) -> dict:
     `git remote get-url`.
     """
     home = _bench_home()
-    env = dict(os.environ, HOME=home)
+    env = _bench_env(home)
     env[BENCH_RUN_ENV] = tag
     baseline = set(_proc_table())
     proc = subprocess.Popen(
@@ -303,7 +397,7 @@ def _detached_run(tag: str) -> dict:
                 break
     proc.wait()
     survivors = [pid for pid in roots if pid in _proc_table()]
-    shutil.rmtree(home, ignore_errors=True)
+    _discard_bench_home(home)
     groups: dict[str, dict] = {}
     for pgid, name in roots.items():
         members = [pid for pid in kin if kin[pid][0] == pgid]

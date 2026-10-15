@@ -15,9 +15,11 @@ from __future__ import annotations
 import importlib.util
 import os
 import resource
-import shutil
+import socket
+import sqlite3
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -127,22 +129,64 @@ class TestGroupCosts:
 
 
 class TestBenchHome:
-    def test_it_hands_the_render_a_push_config_to_find(self, bench):
-        """No push.toml and _spawn_push returns before it reads any gate."""
-        home = Path(bench._bench_home())
-        try:
-            cfg = home / ".config" / "ccreport" / "push.toml"
-            entries = tomllib.loads(cfg.read_text())["server"]
-            assert all(e["token"] for e in entries.values())
-        finally:
-            shutil.rmtree(home, ignore_errors=True)
+    @pytest.fixture
+    def home(self, bench):
+        home = bench._bench_home()
+        yield Path(home)
+        bench._discard_bench_home(home)
+        assert not Path(home).exists()
 
-    def test_it_holds_no_cache_so_every_gate_is_cold(self, bench):
-        home = Path(bench._bench_home())
+    @staticmethod
+    def _port(home: Path) -> int:
+        cfg = home / ".config" / "ccreport" / "push.toml"
+        (url,) = tomllib.loads(cfg.read_text())["server"]
+        return int(url.rsplit(":", 1)[1])
+
+    def test_it_hands_the_render_a_push_config_to_find(self, home):
+        """No push.toml and _spawn_push returns before it reads any gate."""
+        cfg = home / ".config" / "ccreport" / "push.toml"
+        entries = tomllib.loads(cfg.read_text())["server"]
+        assert all(e["token"] for e in entries.values())
+
+    def test_it_seeds_one_account_and_leaves_every_gate_cold(self, home):
+        """The push posts nothing without a signed-in account; the seed is the
+        one row, and the interval gates the render reads are still unset."""
+        db = sqlite3.connect(f"file:{home / '.local/share/ccreport/cache.db'}?mode=ro", uri=True)
         try:
-            assert not (home / ".cache" / "ccreport" / "cache.db").exists()
+            keys = {row[0] for row in db.execute("SELECT key FROM meta")}
+            assert not keys & {"push_next_at", "update_checked_at"}
+            assert db.execute("SELECT COUNT(*) FROM usage").fetchone() == (0,)
+            assert db.execute(
+                "SELECT source, account_uuid FROM account_events"
+            ).fetchall() == [("capture", "energy-bench")]
         finally:
-            shutil.rmtree(home, ignore_errors=True)
+            db.close()
+
+    def test_the_push_target_holds_the_connection_then_closes_without_a_byte(self, bench, home):
+        """Long enough for any ps cadence to see the child, and nothing arrives.
+
+        The close lands as EOF or, with the request still unread in the
+        socket, as a reset. The push reads both as the same non-terminal
+        error; what this checks is that neither comes early and no byte does.
+        """
+        with socket.create_connection(("127.0.0.1", self._port(home)), timeout=5) as conn:
+            conn.sendall(b"POST /v1/ingest HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+            conn.settimeout(bench.PUSH_HOLD_S + 3.0)
+            started = time.monotonic()
+            try:
+                got = conn.recv(1)
+            except ConnectionResetError:
+                got = b""
+            held = time.monotonic() - started
+        assert got == b""
+        assert bench.PUSH_HOLD_S * 0.8 <= held < bench.PUSH_HOLD_S + 1.0
+
+    def test_discarding_the_home_stops_the_push_target(self, bench):
+        home = bench._bench_home()
+        port = self._port(Path(home))
+        bench._discard_bench_home(home)
+        with pytest.raises(OSError):  # refused, reset or timed out all mean closed
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="the ps flags and the wrapper are macOS-only")
