@@ -409,7 +409,8 @@ class TestPushOutput:
             unattributed=7,
         ))
         out = capsys.readouterr().out
-        assert "7 records older than this machine's account log" in out
+        assert "7 records without a known account" in out
+        assert "Codex needs an account ID in its log" in out
         assert "ccreport adopt" in out
 
     def test_a_fully_attributed_run_says_nothing_about_it(self, monkeypatch, capsys):

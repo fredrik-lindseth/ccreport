@@ -23,7 +23,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Self
 
 from ccreport.exchange import get_rate, to_oslo_date
-from ccreport.pricing import calc_cost
+from ccreport.pricing import calc_cost, has_pricing
 
 if TYPE_CHECKING:
     from ccreport.speed import SpeedSums
@@ -68,6 +68,10 @@ class UsageRecord:
     parsed from the log (which never names an account) and not written to the
     record cache, so a change log that grows a missing event fixes every past
     report on the next run instead of needing a re-parse."""
+    source: str = "claude"
+    account_uuid: str | None = None
+    thread_id: str | None = None
+    reasoning_output_tokens: int = 0
     count: int = 1
     """How many API calls this stands for. One, except for the records a rollup
     row deserializes to, which stand for a whole day of a session's calls — the
@@ -106,6 +110,12 @@ class UsageRecord:
         and the pricing lookup is the most expensive thing in the run.
         """
         if self._cost is None:
+            if (self.source == "codex" and self.cost_usd is None
+                    and not has_pricing(self.model, self.timestamp, source=self.source)):
+                # Coverage is reported alongside the subtotal; don't print a
+                # warning for every call of the same unpriced model.
+                self._cost = 0.0
+                return self._cost
             self._cost = self.cost_usd if self.cost_usd is not None else calc_cost(
                 self.tokens.input, self.tokens.output,
                 self.tokens.cache_create, self.tokens.cache_read,
@@ -153,6 +163,7 @@ class AggBucket:
     models: dict[str, float] = field(default_factory=dict)
     """Model name → its USD cost within this bucket; the Models column shows both."""
     count: int = 0
+    unpriced_count: int = 0
 
     def __iadd__(self, other: AggBucket) -> Self:
         """Fold another bucket in — how every report builds its TOTAL row."""
@@ -163,6 +174,7 @@ class AggBucket:
         for model, cost in other.models.items():
             self.models[model] = self.models.get(model, 0.0) + cost
         self.count += other.count
+        self.unpriced_count += other.unpriced_count
         return self
 
 
@@ -270,6 +282,8 @@ def bucket_by(
         if rec.model != "<synthetic>":
             b.models[rec.model] = b.models.get(rec.model, 0.0) + cost
         b.count += rec.count
+        if rec.source == "codex" and not has_pricing(rec.model, rec.timestamp, source=rec.source):
+            b.unpriced_count += rec.count
     return buckets
 
 
@@ -394,6 +408,7 @@ def _agg_json(agg: AggBucket) -> dict:
         "nok_estimated": agg.nok_estimated,
         "models": agg.models,
         "count": agg.count,
+        "unpriced_count": agg.unpriced_count,
     }
 
 
@@ -406,6 +421,7 @@ def _agg_from_json(payload: dict) -> AggBucket:
         nok_estimated=payload.get("nok_estimated", False),
         models=dict(payload.get("models", {})),
         count=payload.get("count", 0),
+        unpriced_count=payload.get("unpriced_count", 0),
     )
 
 
@@ -606,6 +622,18 @@ def account_rows(records: list[UsageRecord], nok: NokCtx) -> ReportRows:
     has two or three and there is nothing to cut off.
     """
     buckets = bucket_by(records, lambda r: r.account, nok)
+    return _ranked_rows(buckets, None, lambda key: Row(key=key, agg=buckets[key]))
+
+
+def tool_rows(records: list[UsageRecord], nok: NokCtx) -> ReportRows:
+    """Usage per originating tool, including cache tokens and calls."""
+    buckets = bucket_by(records, lambda r: r.source, nok)
+    return _ranked_rows(buckets, None, lambda key: Row(key=key, agg=buckets[key]))
+
+
+def model_rows(records: list[UsageRecord], nok: NokCtx) -> ReportRows:
+    """Usage per logged model, including models without a known price."""
+    buckets = bucket_by(records, lambda r: r.model, nok)
     return _ranked_rows(buckets, None, lambda key: Row(key=key, agg=buckets[key]))
 
 

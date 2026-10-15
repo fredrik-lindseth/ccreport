@@ -8,6 +8,7 @@ anywhere — which a report is not.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
@@ -41,6 +42,7 @@ def report(
     project: str | None = Query(default=None),
     account: str | None = Query(default=None),
     machine: str | None = Query(default=None),
+    tool: Literal["claude", "codex"] | None = Query(default=None),
     limit: int | None = Query(default=None),
     breakdown: bool = Query(default=False),
 ) -> dict:
@@ -53,7 +55,7 @@ def report(
     conn = request.app.state.db.connect()
     merged = reports.load(conn, reports.Filters(
         since=_parsed(since, "since"), until=_parsed(until, "until"),
-        project=project, account=account, machine=machine,
+        project=project, account=account, machine=machine, tool=tool,
     ))
     nok = reports.nok_context(merged)
     rows = reports.build(merged, kind, nok, limit=limit, breakdown=breakdown)

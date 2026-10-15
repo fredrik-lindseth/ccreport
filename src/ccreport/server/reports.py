@@ -28,6 +28,7 @@ class Filters:
     project: str | None = None
     account: str | None = None
     machine: str | None = None
+    tool: str | None = None
 
 
 @dataclass
@@ -144,6 +145,9 @@ def _clauses(
     if filters.machine is not None:
         clauses.append(f"{at}machine_id = ?")
         params.append(filters.machine)
+    if filters.tool is not None:
+        clauses.append(f"{at}source = ?")
+        params.append(filters.tool)
     return clauses, params
 
 
@@ -189,11 +193,11 @@ def load(conn: sqlite3.Connection, filters: Filters | None = None) -> list[Merge
     ).fetchall()
 
     labels = dict(conn.execute("SELECT machine_id, label FROM machines").fetchall())
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     merged: list[MergedRecord] = []
     for row in rows:
         machine_id, rec = row[0], dict(zip(REC_COLS, row[1:], strict=True))
-        key = (rec["account_uuid"], rec["dk"])
+        key = (rec["source"], rec["account_uuid"], rec["dk"])
         if rec["dk"] and key in seen:
             continue
         seen.add(key)
@@ -217,6 +221,8 @@ def _as_merged(
     """
     account = account_display(rec["account_uuid"], rec["account_label"], aliases)
     record = UsageRecord(
+        source=rec["source"], account_uuid=rec["account_uuid"],
+        thread_id=rec["thread_id"], reasoning_output_tokens=rec["reasoning_output_tokens"],
         message_id=rec["mid"] or "",
         model=rec["model"],
         tokens=aggregate.TokenCounts(
@@ -250,7 +256,7 @@ def _as_merged(
     )
 
 
-GROUP_COLS = ("machine_id", "account_uuid", "account_label", "project", "model", "day", "oslo_date")
+GROUP_COLS = ("machine_id", "account_uuid", "account_label", "project", "model", "day", "oslo_date", "source")
 """What one grouped row stands for. Every column a merged report groups on
 except the session, which no page folding these rows breaks down by."""
 
@@ -263,7 +269,8 @@ def _narrows_dedup(filters: Filters) -> bool:
     Both are what a page about one machine or one project is for.
 
     Account cannot: the dedup groups by account already, so narrowing to one
-    account leaves every group inside it whole. Neither can the date bounds --
+    account leaves every group inside it whole. Tool cannot either: source is
+    part of the dedup identity. Neither can the date bounds --
     two copies of one call carry the ts their log gave them, so no bound splits
     a pair.
     """
@@ -295,14 +302,15 @@ def _dedup_clause(
         replace(filters, since=None, until=None), aliased=aliased, pairs=pairs,
     )
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-    inner = f"SELECT MIN(id) FROM server_records{where} GROUP BY account_uuid, dk"  # noqa: S608
+    inner = f"SELECT MIN(id) FROM server_records{where} GROUP BY source, account_uuid, dk"  # noqa: S608
     return f"(a.dk IS NULL OR a.dk = '' OR a.id IN ({inner}))", params
 
 
 _GROUP_LIST = ", ".join(f"a.{name}" for name in GROUP_COLS)
 _GROUPED_SQL = f"""
     SELECT {_GROUP_LIST}, MIN(a.ts), SUM(a.cost), COUNT(*),
-           SUM(a.input_tokens), SUM(a.output_tokens), SUM(a.cache_create), SUM(a.cache_read)
+           SUM(a.input_tokens), SUM(a.output_tokens), SUM(a.cache_create), SUM(a.cache_read),
+           SUM(a.reasoning_output_tokens)
       FROM server_records a
      WHERE %s
      GROUP BY {_GROUP_LIST}
@@ -344,7 +352,8 @@ def load_grouped(conn: sqlite3.Connection, filters: Filters | None = None) -> li
 
 _BUCKETED_SQL = f"""
     SELECT {_GROUP_LIST}, MIN(a.ts), SUM(a.cost), COUNT(*),
-           SUM(a.input_tokens), SUM(a.output_tokens), SUM(a.cache_create), SUM(a.cache_read)
+           SUM(a.input_tokens), SUM(a.output_tokens), SUM(a.cache_create), SUM(a.cache_read),
+           SUM(a.reasoning_output_tokens)
       FROM server_records a
      WHERE %s
      GROUP BY {_GROUP_LIST}, CAST(FLOOR((a.ts - ?) / ?) AS INTEGER)
@@ -414,7 +423,7 @@ def load_spend(
     Per account because a window belongs to one: pricing a shared machine's
     windows against everyone's work would bill one person for another's.
     """
-    filters = filters or Filters()
+    filters = replace(filters or Filters(), tool="claude")
     aliases = db.account_aliases(conn)
     aliased = db.accounts_with_alias(conn, filters.account)
     pairs = db.projects_with_alias(conn, filters.project)
@@ -514,10 +523,11 @@ def _as_grouped(
     be read at, not a rounding this builder chose.
     """
     machine_id: str = row[0]
-    account_uuid, account_label, project, model, day, oslo_date = row[1:len(GROUP_COLS)]
-    first_ts, cost, calls, tokens_in, tokens_out, cache_create, cache_read = row[len(GROUP_COLS):]
+    account_uuid, account_label, project, model, day, oslo_date, source = row[1:len(GROUP_COLS)]
+    first_ts, cost, calls, tokens_in, tokens_out, cache_create, cache_read, reasoning = row[len(GROUP_COLS):]
     account = account_display(account_uuid, account_label, aliases)
     record = UsageRecord(
+        source=source, account_uuid=account_uuid, reasoning_output_tokens=reasoning,
         message_id="",
         model=model,
         tokens=aggregate.TokenCounts(
@@ -681,6 +691,8 @@ _KEY_FNS = {
     "project": lambda m: m.record.project,
     "session": lambda m: m.record.session_id,
     "account": lambda m: m.record.account,
+    "model": lambda m: m.record.model,
+    "tool": lambda m: m.record.source,
 }
 
 KINDS = tuple(_KEY_FNS)
@@ -705,6 +717,10 @@ def build(
         report = aggregate.project_rows(records, nok, limit=limit)
     elif kind == "session":
         report = aggregate.session_rows(records, nok, limit=limit)
+    elif kind == "model":
+        report = aggregate.model_rows(records, nok)
+    elif kind == "tool":
+        report = aggregate.tool_rows(records, nok)
     else:
         report = aggregate.account_rows(records, nok)
     _attribute(report.rows, merged, key_fn)

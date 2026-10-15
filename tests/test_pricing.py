@@ -1996,6 +1996,8 @@ class TestPricingPeriodIndex:
         for period in periods:
             if resolved in period["models"]:
                 return period["models"][resolved]
+        if not resolved.startswith("claude-"):
+            return None
         for period in periods:
             for key, prices in period["models"].items():
                 if key in resolved or resolved in key:
@@ -2299,7 +2301,7 @@ class TestIncrementalSessionCost:
             ]
         }
         monkeypatch.setattr(
-            "ccreport.cache_db.load_ccreport_records_for_session", lambda sid: recs
+            "ccreport.cache_db.load_ccreport_records_for_session", lambda sid, **kwargs: recs
         )
         monkeypatch.setattr(pricing, "_find_session_files", lambda *a, **k: set())
         usage = compute_session_usage("s1", self.CWD)
@@ -2566,9 +2568,9 @@ class TestBoundedCostWindows:
         rebuilds = []
         real = cache_db.load_ccreport_records_for_paths
 
-        def spy(paths):
+        def spy(paths, **kwargs):
             rebuilds.append(set(paths))
-            return real(paths)
+            return real(paths, **kwargs)
 
         monkeypatch.setattr(cache_db, "load_ccreport_records_for_paths", spy)
 
@@ -3046,3 +3048,66 @@ class TestWeekWindowStartAcrossAPlanChange:
         from ccreport import pricing
 
         assert pricing.quota_rebase_epoch(None, self.NOW) is None
+
+
+class TestCodexPricing:
+    @pytest.mark.parametrize(("model", "rates"), [
+        ("gpt-5.5", (5, .5, 30)),
+        ("gpt-5.6-terra", (2, .2, 12)),
+        ("gpt-5.6-sol", (4, .4, 20)),
+        ("gpt-6-astra", (10, 1, 50)),
+        ("gpt-6-sol", (2, .2, 10)),
+        ("gpt-6.1-sol", (2, .1, 10)),
+    ])
+    def test_standard_api_rates(self, model, rates):
+        prices = present(find_pricing(model))
+        assert tuple(prices[k] * 1e6 for k in ("input", "cache_read", "output")) == pytest.approx(rates)
+        assert pricing.has_pricing(model)
+
+    @pytest.mark.parametrize("model", [
+        "codex-auto-review", "gpt-5.6-sol-new", "gpt-5.6-t", "gpt-6", "gpt-5.5-pro",
+    ])
+    def test_unknown_variant_does_not_borrow_price(self, model):
+        assert find_pricing(model) is None
+        assert not pricing.has_pricing(model)
+
+    def test_explicit_aliases(self):
+        assert find_pricing("gpt-5.6") == find_pricing("gpt-5.6-sol")
+        assert find_pricing("gpt-5.5-2026-04-23") == find_pricing("gpt-5.5")
+
+    @pytest.mark.parametrize(("model", "date"), [
+        ("gpt-5.5", "2026-04-23"),
+        ("gpt-5.6-terra", "2026-07-30"),
+        ("gpt-5.6-sol", "2026-08-21"),
+        ("gpt-6-astra", "2026-09-03"),
+        ("gpt-6-sol", "2026-09-22"),
+        ("gpt-6.1-sol", "2026-09-29"),
+    ])
+    def test_verified_effective_boundary(self, model, date):
+        start = _parse_effective(date)
+        assert not pricing.has_pricing(model, start - timedelta(seconds=1))
+        assert pricing.has_pricing(model, start)
+
+    def test_cache_is_disjoint_and_output_includes_reasoning(self):
+        # Codex input=100K of which 80K cached: parser supplies 20K + 80K.
+        # Its 2K output includes reasoning; no extra reasoning charge.
+        assert calc_cost(20_000, 2_000, 0, 80_000, "gpt-6-astra") == pytest.approx(.38)
+
+    def test_exact_long_context_boundary(self):
+        assert calc_cost(72_000, 1_000, 0, 200_000, "gpt-6-astra") == pytest.approx(.97)
+
+    def test_long_context_prices_whole_request_including_cached_input(self):
+        assert calc_cost(72_001, 1_000, 0, 200_000, "gpt-6-astra") == pytest.approx(1.91502)
+
+    def test_output_alone_does_not_trigger_long_context(self):
+        assert calc_cost(1, 300_000, 0, 0, "gpt-6-sol") == pytest.approx(3.000002)
+
+    def test_long_context_cache_writes(self):
+        expected = 72_001 * 4e-6 + 200_000 * 5e-6 + 100 * 15e-6
+        assert calc_cost(72_001, 100, 200_000, 0, "gpt-6-sol") == pytest.approx(expected)
+
+    def test_known_free_and_unknown_are_distinct(self):
+        assert pricing.has_pricing("local:latest")
+        assert pricing.has_pricing("<synthetic>")
+        assert not pricing.has_pricing("")
+        assert not pricing.has_pricing("codex-auto-review")

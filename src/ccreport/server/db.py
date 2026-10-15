@@ -81,7 +81,7 @@ CREATE INDEX IF NOT EXISTS idx_tokens_machine ON machine_tokens(machine_id);
 -- double-counts nor silently erases one machine's contribution.
 --
 -- dup is that collapse, decided once at write time instead of per query: 1 on
--- every row that is not the lowest id within its (account_uuid, dk), 0 on the
+-- every row that is not the lowest id within its (account_uuid, source, dk), 0 on the
 -- one that is and on every row the log gave no key. Half this table is dup=1 --
 -- 431,439 rows of 815,841 when the flag was added -- and each read used to
 -- rediscover which half by materialising 384,063 MIN(id) rows. Not in REC_COLS:
@@ -117,7 +117,10 @@ CREATE TABLE IF NOT EXISTS server_records (
     -- where a client older than protocol 3 pushed the file, and on every row
     -- stored before the columns arrived until a `--full` push replaces it.
     req_start     REAL,
-    req_end       REAL
+    req_end       REAL,
+    source        TEXT NOT NULL DEFAULT 'claude',
+    thread_id     TEXT,
+    reasoning_output_tokens INTEGER NOT NULL DEFAULT 0
 );
 
 -- Read-time dedup groups by (account, dedup key): the same call pushed from
@@ -295,19 +298,20 @@ _REC_FIELD_COLS = (
 )
 _REC_TOKEN_COLS = ("input_tokens", "output_tokens", "cache_create", "cache_read")
 REC_TIMING_COLS = ("req_start", "req_end")
-"""The request span. Behind dup in the table, which REC_COLS leaves out."""
-REC_COLS = (*_REC_SOURCE_COLS, *_REC_FIELD_COLS, *_REC_TOKEN_COLS, *REC_TIMING_COLS)
-"""Every server_records column but the rowid and dup, in CREATE TABLE order.
+"""The request span. Behind dup in the physical table."""
+_REC_CODEX_COLS = ("source", "thread_id", "reasoning_output_tokens")
+REC_COLS = (*_REC_SOURCE_COLS, *_REC_FIELD_COLS, *_REC_TOKEN_COLS, *REC_TIMING_COLS, *_REC_CODEX_COLS)
+"""Every transmitted record column, preserving existing tuple positions.
 
-test_server_db asserts that order against PRAGMA table_info, so a column added
-to the DDL alone, or to this tuple alone, fails there rather than silently
-shifting every insert one place to the left.
+The derived dup flag sits before appended source metadata in the physical
+table. INSERTs and SELECTs name these columns explicitly; tests assert the
+physical schema separately so migrations and fresh databases stay aligned.
 """
 
 _REC_SELECT = ", ".join(REC_COLS)
 _REC_PLACEHOLDERS = ", ".join("?" * len(REC_COLS))
 
-# The token counts sit together so a record dict can keep them in one compact
+# Four token counts stay contiguous so a record dict can keep them in one compact
 # "t" list, as the client's does — every other column is read by column name.
 _TOKEN_BASE = len(_REC_SOURCE_COLS) + len(_REC_FIELD_COLS)
 _TIMING_BASE = _TOKEN_BASE + len(_REC_TOKEN_COLS)
@@ -320,6 +324,7 @@ def record_to_row(rec: dict) -> tuple:
         *(rec.get(name) for name in _REC_FIELD_COLS),
         *rec["t"][:len(_REC_TOKEN_COLS)],
         *(rec.get(name) for name in REC_TIMING_COLS),
+        rec.get("source", "claude"), rec.get("thread_id"), rec.get("reasoning_output_tokens", 0),
     )
 
 
@@ -327,7 +332,9 @@ def row_to_record(row: tuple) -> dict:
     """A REC_COLS row as a record dict, token counts folded back into "t"."""
     rec: dict = dict(zip(REC_COLS[:_TOKEN_BASE], row[:_TOKEN_BASE], strict=True))
     rec["t"] = list(row[_TOKEN_BASE:_TIMING_BASE])
-    rec.update(zip(REC_TIMING_COLS, row[_TIMING_BASE:], strict=True))
+    codex_base = _TIMING_BASE + len(REC_TIMING_COLS)
+    rec.update(zip(REC_TIMING_COLS, row[_TIMING_BASE:codex_base], strict=True))
+    rec.update(zip(_REC_CODEX_COLS, row[codex_base:], strict=True))
     return rec
 
 
@@ -340,27 +347,28 @@ _TURN_PLACEHOLDERS = ", ".join("?" * len(TURN_COLS))
 
 _ACCOUNT_AT = REC_COLS.index("account_uuid")
 _DK_AT = REC_COLS.index("dk")
+_SOURCE_AT = REC_COLS.index("source")
 
-DedupKey = tuple[str, str]
-"""One (account_uuid, dk) pair: the grain the dedup flag is decided at."""
+DedupKey = tuple[str, str, str]
+"""One (account_uuid, source, dk) triple: the grain the dedup flag is decided at."""
 
 _RECONCILE_CHUNK = 1000
-"""Keys per reconcile statement. Two parameters each, well under SQLite's
+"""Keys per reconcile statement. Three parameters each, well under SQLite's
 variable ceiling, and small enough that the VALUES list stays cheap to parse."""
 
 _RECONCILE_SQL = """\
 UPDATE server_records AS s
    SET dup = CASE WHEN s.id = w.min_id THEN 0 ELSE 1 END
-  FROM (SELECT account_uuid, dk, MIN(id) AS min_id
-          FROM server_records INDEXED BY idx_srec_account_dk
-         WHERE (account_uuid, dk) IN (VALUES %s)
-      GROUP BY account_uuid, dk) AS w
- WHERE s.account_uuid = w.account_uuid AND s.dk = w.dk
+  FROM (SELECT account_uuid, source, dk, MIN(id) AS min_id
+          FROM server_records INDEXED BY idx_srec_source_dk
+         WHERE (account_uuid, source, dk) IN (VALUES %s)
+      GROUP BY account_uuid, source, dk) AS w
+ WHERE s.account_uuid = w.account_uuid AND s.source = w.source AND s.dk = w.dk
    AND s.dup <> CASE WHEN s.id = w.min_id THEN 0 ELSE 1 END
 """
 """One chunk of keys, re-flagged inside the write transaction a push holds.
 
-INDEXED BY holds the inner search on (account_uuid, dk); without it the planner
+INDEXED BY holds the inner search on (account_uuid, source, dk); without it the planner
 searches idx_srec_acct_ts and reads the account's every row per chunk, since this
 database refuses ANALYZE and has no statistics to say otherwise -- 1.52s against
 0.37s for a 10,000-key file over 800,000 rows. The trailing comparison writes
@@ -389,7 +397,7 @@ def _reconcile_dup(conn: sqlite3.Connection, keys: set[DedupKey]) -> None:
     ordered = sorted(keys)
     for start in range(0, len(ordered), _RECONCILE_CHUNK):
         chunk = ordered[start:start + _RECONCILE_CHUNK]
-        values = ", ".join(["(?, ?)"] * len(chunk))
+        values = ", ".join(["(?, ?, ?)"] * len(chunk))
         conn.execute(_RECONCILE_SQL % values, [part for key in chunk for part in key])
 
 
@@ -416,14 +424,27 @@ def reconcile_all_dup(conn: sqlite3.Connection) -> None:
     conn.execute(
         "UPDATE server_records SET dup = 0 WHERE dup <> 0 AND (dk IS NULL OR dk = '')",
     )
+    has_source = any(row[1] == "source" for row in conn.execute("PRAGMA table_info(server_records)"))
+    if not has_source:
+        conn.execute("""
+            UPDATE server_records AS s
+               SET dup = CASE WHEN s.id = w.min_id THEN 0 ELSE 1 END
+              FROM (SELECT account_uuid, dk, MIN(id) AS min_id
+                      FROM server_records
+                     WHERE dk IS NOT NULL AND dk <> ''
+                  GROUP BY account_uuid, dk) AS w
+             WHERE s.account_uuid = w.account_uuid AND s.dk = w.dk
+               AND s.dup <> CASE WHEN s.id = w.min_id THEN 0 ELSE 1 END
+        """)
+        return
     conn.execute("""
         UPDATE server_records AS s
            SET dup = CASE WHEN s.id = w.min_id THEN 0 ELSE 1 END
-          FROM (SELECT account_uuid, dk, MIN(id) AS min_id
+          FROM (SELECT account_uuid, source, dk, MIN(id) AS min_id
                   FROM server_records
                  WHERE dk IS NOT NULL AND dk <> ''
-              GROUP BY account_uuid, dk) AS w
-         WHERE s.account_uuid = w.account_uuid AND s.dk = w.dk
+              GROUP BY account_uuid, source, dk) AS w
+         WHERE s.account_uuid = w.account_uuid AND s.source = w.source AND s.dk = w.dk
            AND s.dup <> CASE WHEN s.id = w.min_id THEN 0 ELSE 1 END
     """)
 
@@ -431,7 +452,7 @@ def reconcile_all_dup(conn: sqlite3.Connection) -> None:
 def _file_dedup_keys(conn: sqlite3.Connection, machine_id: str, file_path: str) -> set[DedupKey]:
     """The dedup keys one machine's file currently holds rows for."""
     return set(conn.execute(
-        "SELECT DISTINCT account_uuid, dk FROM server_records "
+        "SELECT DISTINCT account_uuid, source, dk FROM server_records "
         "WHERE machine_id = ? AND file_path = ? AND dk IS NOT NULL AND dk <> ''",
         (machine_id, file_path),
     ))
@@ -504,6 +525,32 @@ def _add_request_timing(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE server_records ADD COLUMN {col} REAL")
 
 
+def _add_codex_records(conn: sqlite3.Connection) -> None:
+    """Add tool identity without moving existing record tuple positions."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(server_records)")}
+    for name, ddl in (
+        ("source", "TEXT NOT NULL DEFAULT 'claude'"),
+        ("thread_id", "TEXT"),
+        ("reasoning_output_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE server_records ADD COLUMN {name} {ddl}")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_srec_source_dk "
+        "ON server_records(account_uuid, source, dk)",
+    )
+    reconcile_all_dup(conn)
+    # The grouping grain gains source; keep its columns contiguous in the
+    # covering index so SQLite need not build a temporary grouping table.
+    conn.execute("DROP INDEX IF EXISTS idx_srec_group")
+    conn.execute("""
+        CREATE INDEX idx_srec_group ON server_records(
+            dup, machine_id, account_uuid, account_label, project, model, day, oslo_date, source,
+            ts, cost, input_tokens, output_tokens, cache_create, cache_read, dk, id,
+            reasoning_output_tokens, req_start, req_end)
+    """)
+
+
 MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(4, "machines.label_updated_at", _add_label_updated_at),
     migrations.Step(5, "project_aliases"),
@@ -513,6 +560,7 @@ MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(9, "idx_srec_group"),
     migrations.Step(10, "server_records.dup", _add_dup_column),
     migrations.Step(11, "server_records.req_start/req_end, server_turns", _add_request_timing),
+    migrations.Step(12, "server_records.codex", _add_codex_records),
 )
 """Every schema change since MIGRATION_BASELINE, in the order they are applied.
 
@@ -1244,7 +1292,7 @@ def replace_file_records(
             rows,
         )
         keys.update(
-            (row[_ACCOUNT_AT], row[_DK_AT]) for row in rows if row[_DK_AT]
+            (row[_ACCOUNT_AT], row[_SOURCE_AT], row[_DK_AT]) for row in rows if row[_DK_AT]
         )
         _reconcile_dup(conn, keys)
         conn.execute(
