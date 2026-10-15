@@ -11,7 +11,9 @@ import json
 import os
 import sys
 import time
-from collections.abc import Callable, Sequence
+import warnings
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -693,6 +695,29 @@ def _load_with_rollups(files: list[Path], live_paths: set[str]) -> list[UsageRec
 # --- Formatting ---
 
 console = Console(soft_wrap=True)
+
+
+@contextmanager
+def _import_diagnostics(tool: str | None) -> Iterator[list[str]]:
+    """Defer our import diagnostics; leave unrelated Python warnings visible."""
+    notes: list[str] = []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", sources.SourceImportWarning)
+        yield notes
+    for item in caught:
+        warning = item.message
+        if isinstance(warning, sources.SourceImportWarning):
+            if tool is None or warning.source == tool:
+                note = f"{sources.tool_label(warning.source)}: {warning.summary}"
+                if note not in notes:
+                    notes.append(note)
+        else:
+            warnings.warn_explicit(item.message, item.category, item.filename, item.lineno)
+
+
+def _print_import_diagnostics(notes: list[str]) -> None:
+    for note in notes:
+        print(f"Import note: {note}", file=sys.stderr)
 NARROW_WIDTH = 100
 
 
@@ -3444,16 +3469,17 @@ def main() -> None:
     # depend on which records come back, only on which recent dates the rate
     # cache is still short of, so it runs while the records are being read.
     prefetch = exchange.start_prefetch()
-    records = load_all_records(
-        since=since, until=until,
-        project_filter=project_filter, account_filter=account_filter,
-        # A rollup row is one day of one session, so it can answer a report's
-        # totals and nothing finer. Every filter selects on something it has
-        # aggregated away, and --json prints one entry per API call.
-        use_rollups=not (since or until or project_filter or account_filter
-                         or wants_json),
-        tool_filter=args.tool,
-    )
+    with _import_diagnostics(args.tool) as import_notes:
+        records = load_all_records(
+            since=since, until=until,
+            project_filter=project_filter, account_filter=account_filter,
+            # A rollup row is one day of one session, so it can answer a report's
+            # totals and nothing finer. Every filter selects on something it has
+            # aggregated away, and --json prints one entry per API call.
+            use_rollups=not (since or until or project_filter or account_filter
+                             or wants_json),
+            tool_filter=args.tool,
+        )
 
     # Local rows alone, always. -A merges the pulled tables below; without it
     # they answer the note under each table instead. Either way `ccreport` opens
@@ -3472,6 +3498,7 @@ def main() -> None:
 
     if not records:
         print("No usage records found.", file=sys.stderr)
+        _print_import_diagnostics(import_notes)
         sys.exit(1)
 
     # Bulk-load exchange rates for all records
@@ -3483,6 +3510,7 @@ def main() -> None:
         # This machine's records alone, whatever -A says: an entry here is one
         # API call, and a pulled row is a day of somebody else's.
         report_json(local, nok=nok)
+        _print_import_diagnostics(import_notes)
         return
 
     command = args.command
@@ -3553,6 +3581,8 @@ def main() -> None:
                 )
             if len({r.source for r in records}) > 1:
                 render_usage_split(aggregate.tool_rows(records, nok), "Tools", "Tool", nok=nok)
+
+    _print_import_diagnostics(import_notes)
 
 
 if __name__ == "__main__":

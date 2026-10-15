@@ -13,6 +13,15 @@ TOOL_NAMES = ("claude", "codex", "opencode")
 TOOL_LABELS = {"claude": "Claude Code", "codex": "Codex", "opencode": "OpenCode"}
 
 
+class SourceImportWarning(RuntimeWarning):
+    """Import detail for library callers, with a concise CLI summary."""
+
+    def __init__(self, message: str, source: str, summary: str):
+        super().__init__(message)
+        self.source = source
+        self.summary = summary
+
+
 @dataclass(frozen=True)
 class SourceUnit:
     """One replaceable session snapshot, including virtual paths for databases.

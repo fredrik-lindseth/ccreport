@@ -228,8 +228,10 @@ def discover_jsonl_files() -> list[Path]:
     except (OSError, ValueError, sqlite3.Error) as exc:
         # Missing/unsupported stores must not overwrite cached session history
         # with empty records. Its prior rows remain on the ordinary orphan path.
-        warnings.warn(f"OpenCode snapshot could not be read: {exc}; keeping cached history",
-                      RuntimeWarning, stacklevel=2)
+        warnings.warn(sources.SourceImportWarning(
+            f"OpenCode snapshot could not be read: {exc}; keeping cached history",
+            "opencode", "Snapshot could not be read; keeping cached history.",
+        ), stacklevel=2)
     else:
         _source_units.update((unit.path, unit) for unit in units)
         files.extend(_source_units)

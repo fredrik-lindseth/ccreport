@@ -274,7 +274,9 @@ call, so these records remain local and are not automatically pushed.
 The supported OpenCode storage format is V1 `message`/`part` data. A database
 containing V2 `session_message` data is reported as unsupported and leaves
 previously cached usage intact. OpenCode request-speed and quota reporting are
-not available. See the [OpenCode calculation notes](docs/calculation-reference.md#12-opencode-usage).
+not available. Import diagnostics appear as short notes after the report;
+`--tool` limits those notes to the selected tool. JSON stdout stays machine-readable.
+See the [OpenCode calculation notes](docs/calculation-reference.md#12-opencode-usage).
 
 ## ccu
 
