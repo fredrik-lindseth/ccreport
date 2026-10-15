@@ -127,6 +127,16 @@ LAST_CHECKED = "2026-10-15"
 
 PRICING_HISTORY: list[dict[str, Any]] = [
     {
+        # Mistral official model card, unchanged input/output; LiteLLM cache-read rate.
+        "effective": "2024-11-18",
+        "models": {
+            "pixtral-large-2411": {
+                "input": 2e-06, "output": 6e-06,
+                "cache_create": 0e-06, "cache_read": 0.2e-06,
+            },
+        },
+    },
+    {
         "effective": "2025-01-01",
         "models": {
             "claude-opus-4-5-20251101": {
@@ -148,6 +158,56 @@ PRICING_HISTORY: list[dict[str, Any]] = [
                 "cache_create": 3.75e-06, "cache_read": 0.3e-06,
                 "input_200k": 6e-06, "output_200k": 22.5e-06,
                 "cache_create_200k": 7.5e-06, "cache_read_200k": 0.6e-06,
+            },
+        },
+    },
+    {
+        # Mistral Codestral 2508 model card and changelog; LiteLLM cache-read rate.
+        "effective": "2025-07-30",
+        "models": {
+            "codestral-2508": {
+                "input": 0.3e-06, "output": 0.9e-06,
+                "cache_create": 0e-06, "cache_read": 0.03e-06,
+            },
+        },
+    },
+    {
+        # GPT-5 Mini launched 2025-08-07; official model page and API changelog.
+        "effective": "2025-08-07",
+        "models": {
+            "gpt-5-mini": {
+                "input": 0.25e-06, "output": 2e-06,
+                "cache_create": 0.0, "cache_read": 0.025e-06,
+            },
+        },
+    },
+    {
+        # Mistral Large 3 model card and changelog; LiteLLM cache-read rate.
+        "effective": "2025-12-02",
+        "models": {
+            "mistral-large-2512": {
+                "input": 0.5e-06, "output": 1.5e-06,
+                "cache_create": 0e-06, "cache_read": 0.05e-06,
+            },
+        },
+    },
+    {
+        # Mistral launch announcement: free until paid access began 2026-01-27.
+        "effective": "2025-12-09",
+        "models": {
+            "devstral-2512": {
+                "input": 0e-06, "output": 0e-06,
+                "cache_create": 0e-06, "cache_read": 0e-06,
+            },
+        },
+    },
+    {
+        # Mistral changelog: Devstral 2 moves to paid API access; LiteLLM cache rate.
+        "effective": "2026-01-27",
+        "models": {
+            "devstral-2512": {
+                "input": 0.4e-06, "output": 2e-06,
+                "cache_create": 0e-06, "cache_read": 0.04e-06,
             },
         },
     },
@@ -249,6 +309,31 @@ PRICING_HISTORY: list[dict[str, Any]] = [
         },
     },
     {
+        # xAI release notes: Grok 4.5 launched 2026-07-08. Standard API
+        # rates verified against docs.x.ai/developers/pricing and LiteLLM.
+        "effective": "2026-07-08",
+        "models": {
+            "grok-4.5": {
+                "input": 2e-06, "output": 6e-06,
+                "cache_create": 0.0, "cache_read": 0.3e-06,
+                # xAI's price table says long context >=200k (inclusive).
+                "long_prompt": 199_999,
+                "input_long": 4e-06, "output_long": 12e-06,
+                "cache_create_long": 0.0, "cache_read_long": 0.6e-06,
+            },
+        },
+    },
+    {
+        # Kimi official launch and pricing/chat.md; writes use documented default 5min TTL.
+        "effective": "2026-07-16",
+        "models": {
+            "kimi-k3": {
+                "input": 3e-06, "output": 15e-06,
+                "cache_create": 3e-06, "cache_read": 0.3e-06,
+            },
+        },
+    },
+    {
         # Opus 5 released 2026-07-24, same pricing as 4.8 ($5/$25 per MTok),
         # 1M context with no long-context premium. Fast mode is 2x base
         # ($10/$50) but rides the same model ID — records carry a separate
@@ -264,6 +349,14 @@ PRICING_HISTORY: list[dict[str, Any]] = [
     {
         "effective": "2026-07-30",
         "models": {
+            # Luna's 80% reduction took effect with Terra's on July 30.
+            "gpt-5.6-luna": {
+                "input": 0.2e-06, "output": 1.2e-06,
+                "cache_create": 0.25e-06, "cache_read": 0.02e-06,
+                "long_prompt": 272_000,
+                "input_long": 0.4e-06, "output_long": 1.8e-06,
+                "cache_create_long": 0.5e-06, "cache_read_long": 0.04e-06,
+            },
             "gpt-5.6-terra": {
                 "input": 2e-06, "output": 12e-06,
                 "cache_create": 2.5e-06, "cache_read": 0.2e-06,
@@ -347,6 +440,18 @@ PRICING_HISTORY: list[dict[str, Any]] = [
 ]
 
 MODEL_ALIASES: dict[str, str] = {
+    # Official Mistral model cards name these exact API aliases.
+    "codestral-latest": "codestral-2508",
+    "mistral-large-latest": "mistral-large-2512",
+    "pixtral-large-latest": "pixtral-large-2411",
+    # OpenCode/Copilot expose these exact Anthropic model spellings. Keep the
+    # original ID on records; aliases only resolve the Standard API valuation.
+    "claude-opus-4.5": "claude-opus-4-5-20251101",
+    "claude-opus-4.6": "claude-opus-4-6",
+    "claude-opus-4.7": "claude-opus-4-7",
+    "claude-haiku-4.5": "claude-haiku-4-5-20251001",
+    "claude-sonnet-4.5": "claude-sonnet-4-5-20250929",
+    "claude-sonnet-4-0": "claude-sonnet-4-20250514",
     "gpt-5.6": "gpt-5.6-sol",
     "gpt-5.5-2026-04-23": "gpt-5.5",
     "claude-opus-4-5": "claude-opus-4-5-20251101",
@@ -486,8 +591,12 @@ def has_pricing(model: str, ts: datetime | None = None, *, source: str | None = 
     # Claude's local-provider convention does not establish whether an
     # arbitrary Codex provider/model is free. Preserve its token usage as
     # unpriced until that provider's accounting is known.
-    if source == "codex" and ":" in model:
+    if source is not None and source != "claude" and ":" in model:
         return False
+    if source == "opencode":
+        resolved = MODEL_ALIASES.get(model, model)
+        if not any(resolved in period["models"] for period in PRICING_HISTORY):
+            return False
     return bool(model and model.startswith("<")) or find_pricing(model, ts) is not None
 
 

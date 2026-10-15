@@ -22,6 +22,7 @@ from datetime import date, datetime, timedelta
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Self
 
+from ccreport import sources
 from ccreport.exchange import get_rate, to_oslo_date
 from ccreport.pricing import calc_cost, has_pricing
 
@@ -69,6 +70,8 @@ class UsageRecord:
     record cache, so a change log that grows a missing event fixes every past
     report on the next run instead of needing a re-parse."""
     source: str = "claude"
+    provider: str | None = None
+    reported_cost_usd: float | None = None
     account_uuid: str | None = None
     thread_id: str | None = None
     reasoning_output_tokens: int = 0
@@ -110,8 +113,7 @@ class UsageRecord:
         and the pricing lookup is the most expensive thing in the run.
         """
         if self._cost is None:
-            if (self.source == "codex" and self.cost_usd is None
-                    and not has_pricing(self.model, self.timestamp, source=self.source)):
+            if self.cost_usd is None and not self.is_priced():
                 # Coverage is reported alongside the subtotal; don't print a
                 # warning for every call of the same unpriced model.
                 self._cost = 0.0
@@ -122,6 +124,16 @@ class UsageRecord:
                 self.model, self.timestamp,
             )
         return self._cost
+
+    def is_priced(self) -> bool:
+        """Whether this record has a documented valuation for its source.
+
+        Claude keeps its existing logged-cost semantics. External tools use
+        API valuation; a provider-reported zero does not establish a free call.
+        """
+        return sources.is_claude(self.source) or has_pricing(
+            self.model, self.timestamp, source=self.source,
+        )
 
     def local(self) -> datetime:
         """The timestamp in the machine's zone, which is how days are bucketed."""
@@ -282,7 +294,7 @@ def bucket_by(
         if rec.model != "<synthetic>":
             b.models[rec.model] = b.models.get(rec.model, 0.0) + cost
         b.count += rec.count
-        if rec.source == "codex" and not has_pricing(rec.model, rec.timestamp, source=rec.source):
+        if not rec.is_priced():
             b.unpriced_count += rec.count
     return buckets
 
@@ -633,8 +645,15 @@ def tool_rows(records: list[UsageRecord], nok: NokCtx) -> ReportRows:
 
 def model_rows(records: list[UsageRecord], nok: NokCtx) -> ReportRows:
     """Usage per logged model, including models without a known price."""
-    buckets = bucket_by(records, lambda r: r.model, nok)
+    buckets = bucket_by(records, model_key, nok)
     return _ranked_rows(buckets, None, lambda key: Row(key=key, agg=buckets[key]))
+
+
+def model_key(record: UsageRecord) -> str:
+    """The model report's label, preserving OpenCode's provider distinction."""
+    if record.source == "opencode" and record.provider:
+        return f"{record.model} ({record.provider})"
+    return record.model
 
 
 def session_rows(records: list[UsageRecord], nok: NokCtx, limit: int | None = 20) -> ReportRows:

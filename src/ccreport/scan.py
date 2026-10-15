@@ -8,7 +8,9 @@ file rather than every report renderer beside it.
 
 import hashlib
 import re
+import sqlite3
 import subprocess
+import warnings
 from datetime import UTC, datetime
 from functools import cache
 from pathlib import Path
@@ -16,7 +18,7 @@ from typing import NamedTuple
 
 import orjson
 
-from ccreport import codex_scan, project_identity
+from ccreport import codex_scan, project_identity, sources
 from ccreport.aggregate import TokenCounts, UsageRecord
 from ccreport.cache_db import (
     check_ccreport_valid,
@@ -91,12 +93,16 @@ def _resolve_remote(cwd: str) -> str | None:
 # every edit here, this comment included, so it can say only "something changed",
 # never "the stored format did". This is the deliberate knob on the reader's
 # side of the contract, as the salt is on cache_db's.
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 
 # Freshly parsed files buffered before one write transaction. Small enough
 # that a full re-parse never holds the write lock across a long stretch of
 # parsing — a statusline waiting on that lock gives up after 10 s.
 _SAVE_BATCH = 250
+
+# Snapshot identity for virtual sessions, rebuilt once per discovery. Keeping
+# it beside discovery lets existing CLI callers retain their list[Path] API.
+_source_units: dict[Path, sources.SourceUnit] = {}
 
 
 @cache
@@ -120,6 +126,8 @@ def _script_hash() -> str:
         h.update(Path(__file__).read_bytes())
         h.update(Path(project_identity.__file__).read_bytes())
         h.update(Path(codex_scan.__file__).read_bytes())
+        h.update(Path(sources.__file__).read_bytes())
+        h.update(Path(__file__).with_name("opencode_scan.py").read_bytes())
     except OSError:
         return ""
     try:
@@ -148,6 +156,8 @@ def _serialize_records(records: list) -> list[dict]:
             **({"source": r.source, "account_uuid": r.account_uuid,
                 "thread_id": r.thread_id, "reasoning_output_tokens": r.reasoning_output_tokens}
                if r.source != "claude" else {}),
+            **({"provider": r.provider, "reported_cost_usd": r.reported_cost_usd}
+               if r.provider is not None or r.reported_cost_usd is not None else {}),
             "mid": r.message_id,
             "model": r.model,
             "ts": r.timestamp.timestamp(),
@@ -170,6 +180,8 @@ def _deserialize_records(raw: list[dict]) -> list:
     return [
         UsageRecord(
             source=r.get("source", "claude"),
+            provider=r.get("provider"),
+            reported_cost_usd=r.get("reported_cost_usd"),
             account_uuid=r.get("account_uuid"),
             thread_id=r.get("thread_id"),
             reasoning_output_tokens=r.get("reasoning_output_tokens", 0),
@@ -202,11 +214,25 @@ def project_display_name(project_dir: str) -> str:
 
 
 def discover_jsonl_files() -> list[Path]:
+    """Discover physical logs and current virtual OpenCode session snapshots."""
+    from ccreport import opencode_scan
+
+    _source_units.clear()
     files = []
     for d in _PROJECT_ROOTS:
         if d.is_dir():
             files.extend(d.rglob("*.jsonl"))
     files.extend(codex_scan.discover_codex_files())
+    try:
+        units = opencode_scan.discover_opencode_units()
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        # Missing/unsupported stores must not overwrite cached session history
+        # with empty records. Its prior rows remain on the ordinary orphan path.
+        warnings.warn(f"OpenCode snapshot could not be read: {exc}; keeping cached history",
+                      RuntimeWarning, stacklevel=2)
+    else:
+        _source_units.update((unit.path, unit) for unit in units)
+        files.extend(_source_units)
     return sorted(set(files))
 
 
@@ -420,16 +446,23 @@ def _refresh_changed_files(
     pending_turns: dict[str, list[Turn]] = {}
     for path in files:
         key = str(path)
-        try:
-            st = path.stat()
-        except OSError:
-            unreadable.add(key)
-            continue
+        unit = _source_units.get(path)
+        if unit is not None:
+            mtime_ns, size = unit.mtime_ns, unit.size
+        else:
+            try:
+                st = path.stat()
+            except OSError:
+                unreadable.add(key)
+                continue
+            mtime_ns, size = st.st_mtime_ns, st.st_size
         cached = file_meta.get(key)
-        if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+        if cached and cached[0] == mtime_ns and cached[1] == size:
             continue
         try:
-            if codex_scan.is_codex_file(path):
+            if unit is not None:
+                records, turns = unit.records, []
+            elif codex_scan.is_codex_file(path):
                 records, turns = codex_scan.parse_rollout_file(path), []
             else:
                 records, turns = parse_jsonl(path)
@@ -440,7 +473,7 @@ def _refresh_changed_files(
             unreadable.add(key)
             continue
         fresh[key] = records
-        pending.append((key, st.st_mtime_ns, st.st_size, _serialize_records(records)))
+        pending.append((key, mtime_ns, size, _serialize_records(records)))
         if turns:
             pending_turns[key] = turns
         if len(pending) >= _SAVE_BATCH:

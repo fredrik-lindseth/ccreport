@@ -31,6 +31,7 @@ def _record(**over) -> dict:
         "t": [10, 20, 30, 40],
         "req_start": 1_699_999_990.0, "req_end": 1_700_000_000.0,
         "source": "claude", "thread_id": None, "reasoning_output_tokens": 0,
+        "provider": None, "reported_cost_usd": None,
     }
     rec.update(over)
     return rec
@@ -44,7 +45,7 @@ class TestSchema:
         one and not the other shifts every insert one place and lands here.
         """
         cols = [row[1] for row in conn.execute("PRAGMA table_info(server_records)")]
-        assert cols == ["id", *db.REC_COLS[:-5], "dup", *db.REC_COLS[-5:]]
+        assert cols == ["id", *db.REC_COLS[:-7], "dup", *db.REC_COLS[-7:]]
 
     @pytest.mark.parametrize(
         ("table", "cols"),
@@ -177,7 +178,7 @@ class TestSchema:
         old_schema = old_schema[:first_new].rstrip().removesuffix(",") + old_schema[last_new:]
         with monkeypatch.context() as old:
             old.setattr(db, "_SCHEMA_SQL", old_schema)
-            old.setattr(db, "MIGRATION_CHAIN", db.MIGRATION_CHAIN[:-2])
+            old.setattr(db, "MIGRATION_CHAIN", db.MIGRATION_CHAIN[:-3])
             old.setattr(db, "SCHEMA_VERSION", 10)
             first = db.connect(path)
             db.upsert_machine(first, "m1", "m1", 100.0)
@@ -194,7 +195,7 @@ class TestSchema:
         second = db.connect(path)
         try:
             cols = [row[1] for row in second.execute("PRAGMA table_info(server_records)")]
-            assert cols == ["id", *db.REC_COLS[:-5], "dup", *db.REC_COLS[-5:]]
+            assert cols == ["id", *db.REC_COLS[:-7], "dup", *db.REC_COLS[-7:]]
             rec = db.load_file_records(second, "m1", "/p/a.jsonl")[0]
             assert (rec["mid"], rec["req_start"], rec["req_end"]) == ("msg_1", None, None)
             assert [row[1] for row in second.execute("PRAGMA table_info(server_turns)")] == list(
@@ -334,7 +335,7 @@ class TestRecordRows:
         assert row[db.REC_COLS.index("cost")] == 1.25
         assert row[db.REC_COLS.index("machine_id")] == "m1"
         assert row[16:20] == (10, 20, 30, 40)
-        assert row[-3:] == ("claude", None, 0)
+        assert row[-5:] == ("claude", None, 0, None, None)
         assert row[20:22] == (1_699_999_990.0, 1_700_000_000.0)
 
     def test_a_missing_field_becomes_null_rather_than_a_key_error(self):

@@ -117,7 +117,7 @@ def test_new_cli_commands_and_tool_filter(monkeypatch, command):
 
 
 def test_verified_codex_json_retains_price(monkeypatch):
-    monkeypatch.setattr(pricing, "has_pricing", lambda *a, **kw: True)
+    monkeypatch.setattr(aggregate, "has_pricing", lambda *a, **kw: True)
     entry = ccr._json_entry(record(cost_usd=2), aggregate.NokCtx())
     assert entry["cost_usd"] == 2
 

@@ -26,7 +26,7 @@ can both reach has to cost neither of them an import.
 
 from __future__ import annotations
 
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 """What this build speaks. See the bump rule above."""
 
 PRE_VERSIONING = 0

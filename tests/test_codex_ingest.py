@@ -108,7 +108,7 @@ def test_machine_deletion_promotes_source_winner(app):
 def test_existing_database_migrates_to_default_claude(tmp_path, monkeypatch):
     path = tmp_path / "old.db"
     with monkeypatch.context() as old:
-        old.setattr(db, "MIGRATION_CHAIN", db.MIGRATION_CHAIN[:-1])
+        old.setattr(db, "MIGRATION_CHAIN", db.MIGRATION_CHAIN[:-2])
         old.setattr(db, "SCHEMA_VERSION", 11)
         old.setattr(db, "_SCHEMA_SQL", db._SCHEMA_SQL.replace(
             ",\n    source        TEXT NOT NULL DEFAULT 'claude',\n    thread_id     TEXT,\n"
@@ -123,7 +123,7 @@ def test_existing_database_migrates_to_default_claude(tmp_path, monkeypatch):
         conn.commit()
         conn.close()
     conn = db.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
     assert conn.execute("SELECT source,thread_id,reasoning_output_tokens FROM server_records").fetchone() == (
         "claude", None, 0,
     )
