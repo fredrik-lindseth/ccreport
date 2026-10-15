@@ -214,15 +214,24 @@ def project_display_name(project_dir: str) -> str:
 
 
 def discover_jsonl_files() -> list[Path]:
-    """Discover physical logs and current virtual OpenCode session snapshots."""
+    """Discover physical logs and current virtual OpenCode session snapshots.
+
+    A tool switched off in `sources` is not looked for at all. Its cached rows
+    then sit on the orphan path, as a purged log's do, which keeps them through
+    an invalidation for the day the tool is switched back on.
+    """
     from ccreport import opencode_scan
 
     _source_units.clear()
+    enabled = sources.enabled_sources()
     files = []
     for d in _PROJECT_ROOTS:
         if d.is_dir():
             files.extend(d.rglob("*.jsonl"))
-    files.extend(codex_scan.discover_codex_files())
+    if "codex" in enabled:
+        files.extend(codex_scan.discover_codex_files())
+    if "opencode" not in enabled:
+        return sorted(set(files))
     try:
         units = opencode_scan.discover_opencode_units()
     except (OSError, ValueError, sqlite3.Error) as exc:

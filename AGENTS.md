@@ -568,6 +568,15 @@ Detailed calculations: `docs/calculation-reference.md`. Read on demand.
   internet. Nothing updates it: a new version is a deliberate copy plus an edit
   to that directory's README, and `tests/test_dashboard.py` fails if any
   template or asset grows a remote origin
+- Which tools are read is `sources.enabled_sources()` on the client (`sources`
+  in ccreport.toml) and `server/config.enabled_sources()` on the server
+  (`CCREPORT_SERVER_SOURCES`); Claude is always in both. A tool switched off is
+  hidden, never deleted: `scan.discover_jsonl_files` stops looking for it, so
+  its cached rows sit on the orphan path, `load_all_records` filters them out,
+  `push.changed_files` stops offering its files, ingest answers them `skipped`
+  (a `rejected` file is resent forever) and `reports._clauses`/`_dedup_clause`
+  leave stored rows out of every page. A new reader of either table goes
+  through those, or it draws what the switch hid
 - `exchange.py` keeps the Norges Bank walk-back and the negative cache; where
   the rows land is swappable through `use_rate_store`, which is how the server
   converts against its own `exchange_rates` table instead of a client cache

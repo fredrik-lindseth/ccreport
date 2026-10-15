@@ -12,6 +12,7 @@ _real_start_prefetch = _exchange.start_prefetch
 CONFIGURED_BY_ENV = (
     "XDG_DATA_HOME",
     "CODEX_HOME",
+    "CCREPORT_SERVER_SOURCES",
     "CCQUOTA_STOP",
     "CCQUOTA_STOP_SESSION",
     "CCQUOTA_STOP_WEEK",

@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
 
-from ccreport import protocol, tier_timeline
+from ccreport import protocol, sources, tier_timeline
 
 CONFIG_PATH = Path.home() / ".config" / "ccreport" / "push.toml"
 
@@ -615,10 +615,19 @@ def changed_files(
     the rows themselves are gone, so offering one would send a file with no
     records — and the server keys a file on (machine, path) and replaces what it
     holds, so a `--full` would empty out history it is the only copy of.
+
+    So are the files of a tool switched off in `sources`. Each file is one
+    tool's, and leaving it off the offer leaves the server's copy as it stands
+    and its watermark where it was, so switching the tool back on sends it.
     """
+    disabled = sorted(sources.ALL_SOURCES - sources.enabled_sources())
+    marks = ", ".join("?" * len(disabled))
+    skip = (f"AND NOT EXISTS (SELECT 1 FROM ccreport_records r "  # noqa: S608 - placeholders only
+            f"WHERE r.file_id = f.id AND r.source IN ({marks})) ") if disabled else ""
     rows = conn.execute(
-        "SELECT path, mtime_ns, size FROM ccreport_files "
-        "WHERE archived = 0 ORDER BY path"
+        "SELECT f.path, f.mtime_ns, f.size FROM ccreport_files f "  # noqa: S608
+        f"WHERE f.archived = 0 {skip}ORDER BY f.path",
+        disabled,
     ).fetchall()
     return [
         (path, mtime_ns, size)

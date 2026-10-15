@@ -1,6 +1,6 @@
 """Server configuration, read from the environment.
 
-Four values, no config library and no file: the server runs as one process
+Six values, no config library and no file: the server runs as one process
 under a supervisor that already has an environment to set. The client end of
 the same link is the opposite — `ccreport server connect` writes a file,
 because a token belongs in a mode-0600 path rather than in a process listing.
@@ -15,11 +15,14 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from ccreport import sources
+
 DB_ENV = "CCREPORT_SERVER_DB"
 HOST_ENV = "CCREPORT_SERVER_HOST"
 PORT_ENV = "CCREPORT_SERVER_PORT"
 NETWORKS_ENV = "CCREPORT_SERVER_NETWORKS"
 MAX_BODY_ENV = "CCREPORT_SERVER_MAX_BODY"
+SOURCES_ENV = "CCREPORT_SERVER_SOURCES"
 
 DEFAULT_DB_PATH = Path.home() / ".local" / "share" / "ccreport" / "server.db"
 DEFAULT_HOST = "127.0.0.1"
@@ -46,6 +49,8 @@ class ServerConfig:
     networks: tuple[str, ...]
     """CIDRs or bare addresses allowed to reach the web UI; see middleware.py."""
     max_body_bytes: int
+    sources: frozenset[str] = sources.ALL_SOURCES
+    """The tools this server ingests and reports; see enabled_sources()."""
 
 
 def _int_env(name: str, default: int) -> int:
@@ -74,4 +79,22 @@ def load_config() -> ServerConfig:
         port=_int_env(PORT_ENV, DEFAULT_PORT),
         networks=networks or DEFAULT_NETWORKS,
         max_body_bytes=_int_env(MAX_BODY_ENV, DEFAULT_MAX_BODY_BYTES),
+        sources=enabled_sources(),
     )
+
+
+def enabled_sources() -> frozenset[str]:
+    """The tools CCREPORT_SERVER_SOURCES switches on, or every tool where it is unset.
+
+    Comma- or space-separated, like CCREPORT_SERVER_NETWORKS, and Claude Code is
+    always among them. Ingest skips a record of any other tool and acknowledges
+    its file all the same, so a client that still sends one is not left
+    retrying it; the reports leave out the rows already stored, which stay in
+    the table for the day the name is put back.
+
+    Its own function rather than only a ServerConfig field because the readers
+    in reports.py are handed a connection, not the app.
+    """
+    raw = os.environ.get(SOURCES_ENV, "")
+    names = [part for part in raw.replace(",", " ").split() if part]
+    return sources.parse_sources(names, SOURCES_ENV) if names else sources.ALL_SOURCES

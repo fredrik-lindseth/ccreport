@@ -13,9 +13,9 @@ import time
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 
-from ccreport import aggregate, exchange, pricing, tier_timeline, windows
+from ccreport import aggregate, exchange, pricing, sources, tier_timeline, windows
 from ccreport.aggregate import NokCtx, ReportRows, Row, UsageRecord
-from ccreport.server import db
+from ccreport.server import config, db
 from ccreport.server.db import REC_COLS
 
 
@@ -148,7 +148,25 @@ def _clauses(
     if filters.tool is not None:
         clauses.append(f"{at}source = ?")
         params.append(filters.tool)
+    hidden = _hidden_sources(at)
+    if hidden is not None:
+        clauses.append(hidden[0])
+        params += hidden[1]
     return clauses, params
+
+
+def _hidden_sources(at: str) -> tuple[str, list] | None:
+    """The clause leaving out every tool CCREPORT_SERVER_SOURCES switched off.
+
+    Here and in _dedup_clause, which between them every read of server_records
+    goes through, so no page draws a row the server would no longer ingest. The
+    rows stay stored. It cannot move the dedup either: source is part of the
+    dedup identity, so a pair of copies is in or out together.
+    """
+    hidden = sorted(sources.ALL_SOURCES - config.enabled_sources())
+    if not hidden:
+        return None
+    return f"{at}source NOT IN ({', '.join('?' * len(hidden))})", hidden
 
 
 def _where(
@@ -301,7 +319,10 @@ def _dedup_clause(
     narrowed to a project or a machine, and nothing else.
     """
     if not _narrows_dedup(filters):
-        return "a.dup = 0", []
+        hidden = _hidden_sources("a.")
+        if hidden is None:
+            return "a.dup = 0", []
+        return f"a.dup = 0 AND {hidden[0]}", hidden[1]
     clauses, params = _clauses(
         replace(filters, since=None, until=None), aliased=aliased, pairs=pairs,
     )

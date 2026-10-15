@@ -278,6 +278,26 @@ not available. Import diagnostics appear as short notes after the report;
 `--tool` limits those notes to the selected tool. JSON stdout stays machine-readable.
 See the [OpenCode calculation notes](docs/calculation-reference.md#12-opencode-usage).
 
+### Leaving a tool out
+
+`sources` in `~/.config/ccreport/ccreport.toml` names the tools this machine
+reads. Unset, it is all three; Claude Code is always on whether it is listed or
+not:
+
+```toml
+sources = ["claude"]            # no Codex, no OpenCode
+```
+
+A tool left out is not looked for, so its logs are not parsed, and every report
+and push leaves out what the cache already holds for it. Those rows are hidden
+rather than deleted, so putting the name back brings the history back,
+including sessions whose logs have since rotated away. A file the server
+already holds stays there; set `CCREPORT_SERVER_SOURCES` on the server to leave
+it out of the merged reports too. If `allow`, `exclude` or the restriction
+changed while a tool was off, run `ccreport server push --full` after putting it
+back: its files missed the re-push that change triggered, and the server keeps
+the names it had.
+
 ## ccu
 
 The quota dashboard, the same numbers as Claude Code's `/usage` screen, from
@@ -349,6 +369,12 @@ docker run -p 8787:8787 -v ccreport-data:/data \
 is the bridge gateway rather than loopback, so the default answers every page
 403.
 
+`CCREPORT_SERVER_SOURCES=claude` (comma- or space-separated, Claude Code always
+included) is the server's half of `sources`. Ingest skips every file from
+any other tool and acknowledges it, so a client that still sends one does not
+retry it. The rows an earlier push stored stay in the database and drop out of
+every page and report until the name is put back.
+
 ## Install from a checkout
 
 ```bash
@@ -399,7 +425,7 @@ check: the stored tag is tied to the version it was compared against.
 |---|---|
 | `~/.local/share/ccreport/cache.db` | Parsed records, costs, usage row, rate-limit samples |
 | `~/.local/share/ccreport/snapshots/` | One daily copy of the above, 14 kept |
-| `~/.config/ccreport/ccreport.toml` | Optional `repo_roots` for project grouping |
+| `~/.config/ccreport/ccreport.toml` | Optional `repo_roots` for project grouping, `sources` for which tools to read |
 
 Not `~/.cache`, despite the file's name: the archive, the account log, the
 rate-limit samples and the push watermarks are not rebuildable from the session

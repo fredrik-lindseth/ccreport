@@ -18,7 +18,7 @@ from typing import Literal, Self
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field, model_validator
 
-from ccreport import exchange, pricing, protocol
+from ccreport import exchange, pricing, protocol, sources
 from ccreport.server import db, pull, tokens
 
 router = APIRouter(prefix="/v1", tags=["ingest"])
@@ -396,14 +396,28 @@ def _turn_row(machine_id: str, path: str, turn: IngestTurn) -> tuple:
     return (machine_id, path, turn.account_uuid, turn.uuid, turn.ts, turn.model, turn.duration_ms)
 
 
-def _ingest_file(conn, machine_id: str, item: IngestFile, now: float) -> FileResult:
-    """Store one file, or say why it was skipped or refused."""
+def _ingest_file(
+    conn, machine_id: str, item: IngestFile, now: float,
+    enabled: frozenset[str] = sources.ALL_SOURCES,
+) -> FileResult:
+    """Store one file, or say why it was skipped or refused.
+
+    A file of a tool CCREPORT_SERVER_SOURCES switched off is skipped before
+    anything is stored, and whatever an earlier push stored for it is left as
+    it stands for the reports to leave out. Skipped rather than refused, because
+    the client moves its watermark on a skip and would resend a refusal forever.
+    """
+    if item.records and all(rec.source not in enabled for rec in item.records):
+        return FileResult(
+            path=item.path, status=SKIPPED,
+            detail=f"Source {item.records[0].source!r} is not ingested by this server.",
+        )
     if not item.replace and db.file_fingerprint(
         conn, machine_id, item.path,
     ) == (item.mtime_ns, item.size):
         return FileResult(path=item.path, status=SKIPPED, records=len(item.records))
     try:
-        rows = [_row(machine_id, item.path, rec) for rec in item.records]
+        rows = [_row(machine_id, item.path, rec) for rec in item.records if rec.source in enabled]
     except LookupError as exc:
         return FileResult(
             path=item.path, status=REJECTED,
@@ -481,7 +495,8 @@ def ingest(
     now = time.time()
     db.upsert_machine(conn, auth.machine_id, batch.label, now)
     _warm_rates(conn, batch.files)
-    results = [_ingest_file(conn, auth.machine_id, item, now) for item in batch.files]
+    enabled = request.app.state.config.sources
+    results = [_ingest_file(conn, auth.machine_id, item, now, enabled) for item in batch.files]
     # After the files, so a batch carrying both leaves the more expensive half
     # committed before this one opens a write transaction of its own.
     stored = db.store_rate_limit_samples(

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`sources` in `ccreport.toml` and `CCREPORT_SERVER_SOURCES` on the server leave Codex or OpenCode out.** Both list the tools to read, default to all three and always include Claude Code. On a machine, a tool left out is not looked for, so its logs are not parsed, and every report and push leaves out what the cache already holds for it. The server skips that tool's files at ingest without asking the client to resend them, and leaves already-stored rows out of every page and report. Nothing is deleted on either side, so putting a name back restores the history. If the push privacy settings changed while a tool was off, run `ccreport server push --full` after switching it back on so the server picks up the new project names.
+
 ### Development
 
 - **The status line energy benchmark sees its push child on every run.** Against a closed port the child had nothing to send and no account to pull for, so it made no request and was gone in 50 ms, under one `ps` sample beside a parallel test run, which failed `test_a_cold_render_is_seen_spawning_both` under `just test`. The bench home now seeds one account capture so the push posts, its push target holds the connection for a second before closing without a byte, and the render gets XDG roots of its own under the bench HOME rather than whatever the shell exports.

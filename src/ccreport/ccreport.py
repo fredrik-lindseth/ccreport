@@ -308,7 +308,11 @@ def load_all_records(
         records = _load_with_rollups(files, live_paths)
     else:
         records = _load_full(files, live_paths, since, until, project_filter, account_filter)
-    return [r for r in records if r.source == tool_filter] if tool_filter else records
+    # The cache still holds what a tool switched off in `sources` logged before
+    # it was; the rollups do too, since a rollup row carries its source.
+    enabled = sources.enabled_sources()
+    return [r for r in records
+            if r.source in enabled and (tool_filter is None or r.source == tool_filter)]
 
 
 def _load_full(
