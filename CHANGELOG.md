@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## 0.2.1 (2026-10-15)
+
 ### Added
 
 - **`sources` in `ccreport.toml` and `CCREPORT_SERVER_SOURCES` on the server leave Codex or OpenCode out.** Both list the tools to read, default to all three and always include Claude Code. On a machine, a tool left out is not looked for, so its logs are not parsed, and every report and push leaves out what the cache already holds for it. The server skips that tool's files at ingest without asking the client to resend them, and leaves already-stored rows out of every page and report. Nothing is deleted on either side, so putting a name back restores the history. If the push privacy settings changed while a tool was off, run `ccreport server push --full` after switching it back on so the server picks up the new project names.
