@@ -207,7 +207,9 @@ CREATE TABLE IF NOT EXISTS ccreport_records (
     source        TEXT NOT NULL DEFAULT 'claude',
     account_uuid  TEXT,
     thread_id     TEXT,
-    reasoning_output_tokens INTEGER NOT NULL DEFAULT 0
+    reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+    provider      TEXT,
+    reported_cost_usd REAL
 );
 
 -- One row per `turn_duration` line: a whole turn, prompt to done, tool runs and
@@ -261,7 +263,9 @@ CREATE TABLE IF NOT EXISTS ccreport_rollups (
     account_uuid  TEXT NOT NULL DEFAULT '',
     thread_id     TEXT NOT NULL DEFAULT '',
     reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (day, oslo_date, sid, project, model, account, source, account_uuid, thread_id)
+    provider      TEXT NOT NULL DEFAULT '',
+    reported_cost_usd REAL,
+    PRIMARY KEY (day, oslo_date, sid, project, model, account, source, account_uuid, thread_id, provider)
 ) WITHOUT ROWID;
 
 -- The all-time cost of every record whose source JSONL is gone, pre-summed.
@@ -1186,6 +1190,18 @@ def _migrate_codex_records(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM meta WHERE key = 'ccreport_rollup_fp'")
 
 
+def _migrate_opencode_records(conn: sqlite3.Connection) -> None:
+    """Preserve OpenCode's provider identity and its nullable reported charge."""
+    for name, declaration in (("provider", "TEXT"), ("reported_cost_usd", "REAL")):
+        if name not in _table_columns(conn, "ccreport_records"):
+            conn.execute(f"ALTER TABLE ccreport_records ADD COLUMN {name} {declaration}")
+    conn.execute("DROP TABLE ccreport_rollups")
+    start = _SCHEMA_SQL.index("CREATE TABLE IF NOT EXISTS ccreport_rollups (")
+    end = _SCHEMA_SQL.index(";", start) + 1
+    conn.execute(_SCHEMA_SQL[start:end])
+    conn.execute("DELETE FROM meta WHERE key = 'ccreport_rollup_fp'")
+
+
 MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(12, "ccreport_records_file_id", _migrate_records_file_id),
     migrations.Step(13, "ccreport_archive", _migrate_files_archived),
@@ -1193,6 +1209,7 @@ MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(15, "account_events.source", _migrate_account_source),
     migrations.Step(16, "request_timing", _migrate_request_timing),
     migrations.Step(17, "codex_records", _migrate_codex_records),
+    migrations.Step(18, "opencode_records", _migrate_opencode_records),
 )
 """Every schema change since MIGRATION_BASELINE, in the order they are applied.
 
@@ -2565,7 +2582,8 @@ _CCR_TOKEN_COLS = ("input_tokens", "output_tokens", "cache_create", "cache_read"
 # After the tokens rather than among the fields, so the positions
 # _group_by_file reads the tokens at did not move when these arrived.
 _CCR_TIMING_COLS = ("req_start", "req_end")
-_CCR_COLS = (*_CCR_FIELD_COLS, *_CCR_TOKEN_COLS, *_CCR_TIMING_COLS)
+_CCR_PROVIDER_COLS = ("provider", "reported_cost_usd")
+_CCR_COLS = (*_CCR_FIELD_COLS, *_CCR_TOKEN_COLS, *_CCR_TIMING_COLS, *_CCR_PROVIDER_COLS)
 
 # What the readers interpolate. Every loader joins ccreport_files back in and
 # leads its row with that table's path, which _group_by_file then strips off;
@@ -2586,7 +2604,7 @@ def _ccr_record_to_row(file_id: int, rec: dict) -> tuple:
         *(rec.get(name, _CCR_FIELD_DEFAULTS.get(name))
           for name in _CCR_FIELD_COLS),
         *rec["t"][:len(_CCR_TOKEN_COLS)],
-        *(rec.get(name) for name in _CCR_TIMING_COLS),
+        *(rec.get(name) for name in (*_CCR_TIMING_COLS, *_CCR_PROVIDER_COLS)),
     )
 
 
@@ -2610,6 +2628,8 @@ def _group_by_file(rows: list[tuple]) -> dict[str, list[dict]]:
             "project": row[5], "cwd": row[6], "repo": row[7], "dk": row[8],
             "cost": row[9], "t": [row[14], row[15], row[16], row[17]],
             "req_start": row[18], "req_end": row[19],
+            **({"provider": row[20], "reported_cost_usd": row[21]}
+               if row[20] is not None or row[21] is not None else {}),
             **({"source": row[10], "account_uuid": row[11], "thread_id": row[12],
                 "reasoning_output_tokens": row[13]}
                if row[10] != "claude" or row[11] is not None or row[12] is not None or row[13] else {}),
@@ -3255,6 +3275,7 @@ _CCR_ROLLUP_COLS = (
     "min_ts", "max_ts",
     "input_tokens", "output_tokens", "cache_create", "cache_read",
     "cost", "n", "source", "account_uuid", "thread_id", "reasoning_output_tokens",
+    "provider", "reported_cost_usd",
 )
 _CCR_ROLLUP_SELECT = ", ".join(_CCR_ROLLUP_COLS)
 _CCR_ROLLUP_PLACEHOLDERS = ", ".join("?" * len(_CCR_ROLLUP_COLS))
@@ -3396,7 +3417,9 @@ def save_ccreport_archive(rows: list[tuple], paths: set[str]) -> int:
                 f"SELECT 1 {_CCR_FROM} WHERE f.path IN ({placeholders}) "
                 "AND r.source != 'claude' LIMIT 1", chunk,
             ).fetchone():
-                raise ValueError("Codex records cannot be archived before provider-aware archive support")
+                raise ValueError(
+                    "External-tool records cannot be archived before provider-aware archive support"
+                )
         conn.executemany(
             f"INSERT INTO ccreport_archive ({_CCR_ARCHIVE_SELECT}) "  # noqa: S608
             f"VALUES ({_CCR_ARCHIVE_PLACEHOLDERS})",

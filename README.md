@@ -1,12 +1,14 @@
 # ccreport
 
-Token usage and cost reporting for Claude Code and Codex, plus a Claude Code
+Token usage and cost reporting for Claude Code, Codex and OpenCode, plus a Claude Code
 quota dashboard and status line: three commands over one cache.
 
 `ccreport` and the status line work off the JSONL session logs Claude Code
 already writes under `~/.claude/projects/` (or `~/.config/claude/projects/`).
 The reports also read Codex rollouts under `$CODEX_HOME/sessions/` and
 `$CODEX_HOME/archived_sessions/`; `CODEX_HOME` defaults to `~/.codex`.
+OpenCode reports read its local SQLite database under
+`$XDG_DATA_HOME/opencode/` (default `~/.local/share/opencode/`).
 
 ## Install
 
@@ -207,7 +209,8 @@ ccreport monthly
 ccreport project --limit 10
 ccreport session --limit 10
 ccreport model --tool codex                 # model, tokens and API value
-ccreport tool                              # Claude Code and Codex totals
+ccreport model --tool opencode              # OpenCode models and token usage
+ccreport tool                              # totals by tool
 ccreport daily --tool claude                # select one tool
 ccreport --tool codex --json                # local calls, including reasoning metadata
 ccreport limits -w session                  # rate-limit window history
@@ -253,6 +256,27 @@ include Codex calls with known account and pricing, but Codex pull into local
 `-A` reports is not supported yet. Use the server's reports for combined Codex
 usage across machines. The status line, `ccu`, quota guard and `limits` continue
 to use Claude Code data only.
+
+OpenCode imports each completed `step-finish` once, keeping provider and model
+metadata. SQLite is authoritative when present; the older `storage/` JSON
+files are read only when the database is absent. Forked history is excluded
+using the original message time, while new calls in forks and subagents count
+normally. Cached input stays separate, and OpenCode's separate reasoning
+count is included in output exactly once.
+
+OpenCode costs use ccreport's API valuation where a verified price exists.
+The original logged cost is retained separately: a logged zero does not prove
+free usage and never overrides the API estimate. Models without a verified
+rate remain `unpriced`. Accounts appear as `OpenCode – unknown account`;
+provider names and current credentials cannot establish who paid for an old
+call, so these records remain local and are not automatically pushed.
+
+The supported OpenCode storage format is V1 `message`/`part` data. A database
+containing V2 `session_message` data is reported as unsupported and leaves
+previously cached usage intact. OpenCode request-speed and quota reporting are
+not available. Import diagnostics appear as short notes after the report;
+`--tool` limits those notes to the selected tool. JSON stdout stays machine-readable.
+See the [OpenCode calculation notes](docs/calculation-reference.md#12-opencode-usage).
 
 ## ccu
 

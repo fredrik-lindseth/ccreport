@@ -733,9 +733,10 @@ def _payload_record(rec: dict, timeline, override) -> dict | None:
     """
     when = datetime.fromtimestamp(rec["ts"], tz=UTC)
     source = rec.get("source", "claude")
-    if source == "codex":
+    if source != "claude":
         uuid = rec.get("account_uuid")
-        account = {"account_uuid": uuid, "account_label": f"{uuid} (ChatGPT)"} if uuid else None
+        label = "ChatGPT" if source == "codex" else source
+        account = {"account_uuid": uuid, "account_label": f"{uuid} ({label})"} if uuid else None
     else:
         account = _attribution(timeline, when)
     if account is None:
@@ -769,6 +770,8 @@ def _payload_record(rec: dict, timeline, override) -> dict | None:
         "source": source,
         "thread_id": rec.get("thread_id"),
         "reasoning_output_tokens": rec.get("reasoning_output_tokens", 0),
+        "provider": rec.get("provider"),
+        "reported_cost_usd": rec.get("reported_cost_usd"),
         **account,
     }
 

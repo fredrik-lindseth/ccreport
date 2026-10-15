@@ -19,7 +19,7 @@ _READ = re.compile(r"""environ\.(?:get|setdefault)\(\s*["']([A-Z_]+)["']""")
 
 # Read by the code and left alone on purpose, for the reasons CONFIGURED_BY_ENV
 # states. Named here so a new variable cannot join them by accident.
-_EXEMPT = {"COLUMNS", "TMPDIR", "TZ", "XDG_CONFIG_HOME", "XDG_DATA_HOME"}
+_EXEMPT = {"COLUMNS", "TMPDIR", "TZ", "XDG_CONFIG_HOME"}
 
 
 class TestEnvironmentIsolation:
@@ -28,10 +28,13 @@ class TestEnvironmentIsolation:
     def test_every_named_variable_is_gone(self):
         """All but the settings isolate_cache_db replaces with safe test values."""
         leaked = set(CONFIGURED_BY_ENV) & set(os.environ)
-        assert leaked == {"CLAUDE_CACHE_SNAPSHOT_DISABLE", "CODEX_HOME"}
+        assert leaked == {"CLAUDE_CACHE_SNAPSHOT_DISABLE", "CODEX_HOME", "XDG_DATA_HOME"}
 
     def test_codex_home_is_a_private_test_directory(self, tmp_path):
         assert os.environ["CODEX_HOME"] == str(tmp_path / "codex")
+
+    def test_opencode_data_home_is_a_private_test_directory(self, tmp_path):
+        assert os.environ["XDG_DATA_HOME"] == str(tmp_path / "xdg-data")
 
     def test_the_snapshot_disable_is_the_suite_s_own_and_not_inherited(self):
         assert os.environ["CLAUDE_CACHE_SNAPSHOT_DISABLE"] == "1"

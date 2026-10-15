@@ -1,4 +1,4 @@
-# Calculation Reference — Claude Code and Codex Usage & Cost Pipeline
+# Calculation Reference — Claude Code, Codex and OpenCode Usage & Cost Pipeline
 
 ## Table of Contents
 
@@ -13,6 +13,7 @@
 9. [Account Attribution](#9-account-attribution)
 10. [Request Speed (speed.py)](#10-request-speed)
 11. [Codex Usage](#11-codex-usage)
+12. [OpenCode Usage](#12-opencode-usage)
 
 ---
 
@@ -534,8 +535,9 @@ else:
 - **Records**: stored as individual rows in `ccreport_records`, keyed to their file by an
   integer `file_id` into `ccreport_files` (indexed on `file_id` and `ts`). Every reader
   joins that table back in to answer with the path
-  `source` distinguishes `claude` from `codex`; Codex also preserves the logged
-  `account_uuid`, `thread_id` and `reasoning_output_tokens` (§11).
+  `source` distinguishes `claude`, `codex` and `opencode`; Codex also preserves
+  the logged `account_uuid`, `thread_id` and `reasoning_output_tokens` (§11).
+  OpenCode preserves provider and reported cost separately from API value (§12).
 - **Orphan preservation**: when JSONL files are purged from disk (e.g. Claude Code auto-cleanup),
   their cached records are kept in SQLite. `load_all_records()` picks them out of the
   `bulk_load_ccreport_cache()` result — every cached file whose path was not seen on disk
@@ -562,7 +564,7 @@ else:
   writes nothing. Nothing rebuilds this table — it is the only copy of the days
   it covers, and `ccreport server push --full` stops being a way to rebuild a
   server from this machine once it has rows
-  Codex files are held back at call grain: their original usage and attribution
+  External-tool files are held back at call grain: their original usage and attribution
   must remain available while model pricing and historical account coverage
   are incomplete. Codex's `archived_sessions` directory is still an input log
   directory and is unrelated to this database archive.
@@ -1909,3 +1911,118 @@ Codex fixture has a model change, an inherited subagent history, a guardian in
 events. Tests compare each parsed call with independent expected counts and
 verify a mixed corpus through cold parsing and warm cache reloads. Existing
 Claude fixtures retain their original format and defaults.
+
+## 12. OpenCode Usage
+
+`opencode_scan.py` supplies normalized records through the same `scan.py` writer
+as Claude Code and Codex. `sources.py` holds the small, explicit source policy
+and the `SourceUnit` contract; adding a source does not change which tool owns
+Claude's account timeline or quota windows. `ccreport model --tool opencode`
+selects OpenCode models, and `ccreport tool` compares the tools. JSON preserves
+`provider` separately from `model` and `source`.
+
+### 12.1 Storage, snapshots and cache identity
+
+The reader defaults to `$XDG_DATA_HOME/opencode/opencode.db`, with
+`~/.local/share` as the default data home. It opens SQLite read-only and reads
+V1 `session`, `project`, `message` and `part` metadata inside one transaction.
+It projects usage and identity fields; message text, tool arguments, account
+rows and credentials are not imported.
+
+Committed changes can live in SQLite's WAL without changing the main file's
+mtime or size. Each session therefore becomes a virtual `SourceUnit` with a
+stable path and a fingerprint of its normalized records. The fingerprint
+covers token counts, model/provider, timestamps, thread/project identity and
+reported cost. Its bounded integer occupies the cache's mtime slot, and the
+serialized metadata length occupies the size slot; neither is filesystem
+metadata. A concurrent commit is picked up by the next snapshot rather than
+mixed into an earlier one.
+
+If the database exists it is authoritative, including when reading it fails.
+Only an absent database enables the older `storage/{session,project,message,part}`
+JSON reader. The two stores are never summed: old JSON commonly survives a
+SQLite migration. Missing stores preserve cached history through the ordinary
+orphan path. Malformed metadata and unsupported schemas fail the snapshot,
+allowing `scan.py` to retain the previous cache. A populated V2 `session_message`
+table is explicitly unsupported; its mere presence while empty is accepted.
+
+### 12.2 Calls, forks and token normalization
+
+A V1 `step-finish` part is one call. Its owning assistant message supplies the
+model and provider; message and session totals are not additional calls. A
+completed assistant message with positive usage is a fallback only when it
+has no `step-finish` parts. An unfinished message is not used as that fallback.
+Multiple steps on one message remain multiple calls.
+
+OpenCode's stored input already excludes cache reads and writes, while its
+stored output excludes reasoning. The conversion is:
+
+```text
+input          = tokens.input
+cache_read     = tokens.cache.read
+cache_create   = tokens.cache.write
+output         = tokens.output + tokens.reasoning
+reasoning      = tokens.reasoning       # preserved subset of normalized output
+record_total   = input + cache_read + cache_create + output
+```
+
+The optional upstream `tokens.total` is not another category. In particular,
+reasoning is never added to `record_total` a second time. Negative or malformed
+counts fail the snapshot instead of creating a partial cached result.
+
+Ordinary dedup uses the native call ID with the source namespace. A manual
+OpenCode fork clones message/part IDs, so ID dedup alone cannot detect its
+inherited usage. The reader excludes messages whose original `time.created`
+precedes their destination session's `time_created`. This follows OpenCode's
+V1 fork transform, which retains original message times. New calls after that
+boundary count normally; missing original timestamps fail explicitly.
+
+Subagents retain their own session IDs. The `parent_id` chain provides the
+thread root, with cycles rejected. Manual forks need not have `parent_id`, so
+this hierarchy is not used to decide which usage is inherited. Project names
+reuse the existing cwd, git remote and project-merge rules.
+
+### 12.3 Cost, accounts and retained history
+
+OpenCode's original `cost` is preserved as `reported_cost_usd`, separately from
+ccreport's API valuation. It is not copied into the overriding `cost_usd` field.
+The source may compute it from provider model rates or from Copilot usage
+metadata, and missing rates can yield zero. It is therefore neither proof of
+free underlying API usage nor a receipt for the user's bill.
+OpenCode's own stats command displays this field with a dollar sign. Its
+Copilot branch converts `totalNanoAiu / 100_000_000_000` before storing the
+value; ccreport preserves that result, not the original nano-AIU counter.
+
+ccreport prices supported models through `pricing.py`; provider and the raw
+model name remain available independently of pricing aliases. Unknown models
+or unsupported pricing periods are unpriced, with the same partial-total and
+JSON-null behavior as Codex. Raw reported cost is retained even when the
+standard API value is unknown.
+
+Account identity is always unknown for this import. A provider identifies a
+route to a model, not a billing account. Neither Claude's account timeline nor
+OpenCode's current credentials are used to invent historical attribution.
+These records are local; the push account guard excludes them. Local `-A`
+pulls remain Claude-only. Purged OpenCode usage stays at call grain so future
+price and identity corrections remain possible.
+
+OpenCode does not contribute to Claude's status line, `ccu`, quota guard or
+`limits`. The reader does not manufacture per-call speed from a message span
+that may cover several steps; request timing remains unavailable.
+
+### 12.4 Evidence and tests
+
+The supported format was checked against OpenCode 1.18.32 and a local V1
+corpus. V2 has schema evidence but no populated local fixture from production,
+which is why it is rejected explicitly. Source references:
+
+- [V1/V2 SQLite schema](https://github.com/anomalyco/opencode/blob/v1.18.32/packages/core/src/session/sql.ts)
+- [Step-finish recording](https://github.com/anomalyco/opencode/blob/v1.18.32/packages/opencode/src/session/processor.ts)
+- [Usage conversion, cost calculation and fork transform](https://github.com/anomalyco/opencode/blob/v1.18.32/packages/opencode/src/session/session.ts)
+- [OpenCode's own output-plus-reasoning statistics](https://github.com/anomalyco/opencode/blob/v1.18.32/packages/opencode/src/cli/cmd/stats.ts)
+
+`tests/test_opencode_scan.py` covers WAL-only changes and snapshot isolation,
+multiple parts, fallback usage, forked history, child sessions, legacy/SQLite
+overlap, metadata fingerprints, malformed data, unsupported V2 and the absence
+of credential/account reads. Integration tests cover the shared cache and
+report pipeline separately.

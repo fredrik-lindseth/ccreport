@@ -57,7 +57,9 @@ class IngestRecord(BaseModel):
     output_tokens: int = Field(default=0, ge=0)
     cache_create: int = Field(default=0, ge=0)
     cache_read: int = Field(default=0, ge=0)
-    source: Literal["claude", "codex"] = "claude"
+    source: Literal["claude", "codex", "opencode"] = "claude"
+    provider: str | None = None
+    reported_cost_usd: float | None = None
     thread_id: str | None = None
     reasoning_output_tokens: int = Field(default=0, ge=0)
     account_uuid: str
@@ -367,6 +369,8 @@ def _row(machine_id: str, path: str, rec: IngestRecord) -> tuple:
         "account_uuid": rec.account_uuid,
         "account_label": rec.account_label,
         "source": rec.source,
+        "provider": rec.provider,
+        "reported_cost_usd": rec.reported_cost_usd,
         "thread_id": rec.thread_id,
         "reasoning_output_tokens": rec.reasoning_output_tokens,
         "mid": rec.mid,

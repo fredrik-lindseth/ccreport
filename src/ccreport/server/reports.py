@@ -222,6 +222,7 @@ def _as_merged(
     account = account_display(rec["account_uuid"], rec["account_label"], aliases)
     record = UsageRecord(
         source=rec["source"], account_uuid=rec["account_uuid"],
+        provider=rec["provider"], reported_cost_usd=rec["reported_cost_usd"],
         thread_id=rec["thread_id"], reasoning_output_tokens=rec["reasoning_output_tokens"],
         message_id=rec["mid"] or "",
         model=rec["model"],
@@ -256,7 +257,10 @@ def _as_merged(
     )
 
 
-GROUP_COLS = ("machine_id", "account_uuid", "account_label", "project", "model", "day", "oslo_date", "source")
+GROUP_COLS = (
+    "machine_id", "account_uuid", "account_label", "project", "model", "day", "oslo_date",
+    "source", "provider",
+)
 """What one grouped row stands for. Every column a merged report groups on
 except the session, which no page folding these rows breaks down by."""
 
@@ -310,7 +314,7 @@ _GROUP_LIST = ", ".join(f"a.{name}" for name in GROUP_COLS)
 _GROUPED_SQL = f"""
     SELECT {_GROUP_LIST}, MIN(a.ts), SUM(a.cost), COUNT(*),
            SUM(a.input_tokens), SUM(a.output_tokens), SUM(a.cache_create), SUM(a.cache_read),
-           SUM(a.reasoning_output_tokens)
+           SUM(a.reasoning_output_tokens), SUM(a.reported_cost_usd)
       FROM server_records a
      WHERE %s
      GROUP BY {_GROUP_LIST}
@@ -353,7 +357,7 @@ def load_grouped(conn: sqlite3.Connection, filters: Filters | None = None) -> li
 _BUCKETED_SQL = f"""
     SELECT {_GROUP_LIST}, MIN(a.ts), SUM(a.cost), COUNT(*),
            SUM(a.input_tokens), SUM(a.output_tokens), SUM(a.cache_create), SUM(a.cache_read),
-           SUM(a.reasoning_output_tokens)
+           SUM(a.reasoning_output_tokens), SUM(a.reported_cost_usd)
       FROM server_records a
      WHERE %s
      GROUP BY {_GROUP_LIST}, CAST(FLOOR((a.ts - ?) / ?) AS INTEGER)
@@ -523,11 +527,13 @@ def _as_grouped(
     be read at, not a rounding this builder chose.
     """
     machine_id: str = row[0]
-    account_uuid, account_label, project, model, day, oslo_date, source = row[1:len(GROUP_COLS)]
-    first_ts, cost, calls, tokens_in, tokens_out, cache_create, cache_read, reasoning = row[len(GROUP_COLS):]
+    account_uuid, account_label, project, model, day, oslo_date, source, provider = row[1:len(GROUP_COLS)]
+    (first_ts, cost, calls, tokens_in, tokens_out, cache_create, cache_read,
+     reasoning, reported) = row[len(GROUP_COLS):]
     account = account_display(account_uuid, account_label, aliases)
     record = UsageRecord(
         source=source, account_uuid=account_uuid, reasoning_output_tokens=reasoning,
+        provider=provider, reported_cost_usd=reported,
         message_id="",
         model=model,
         tokens=aggregate.TokenCounts(
@@ -691,7 +697,7 @@ _KEY_FNS = {
     "project": lambda m: m.record.project,
     "session": lambda m: m.record.session_id,
     "account": lambda m: m.record.account,
-    "model": lambda m: m.record.model,
+    "model": lambda m: aggregate.model_key(m.record),
     "tool": lambda m: m.record.source,
 }
 

@@ -10,6 +10,7 @@ _real_start_prefetch = _exchange.start_prefetch
 """Captured at import, before no_speculative_prefetch swaps the module attribute."""
 
 CONFIGURED_BY_ENV = (
+    "XDG_DATA_HOME",
     "CODEX_HOME",
     "CCQUOTA_STOP",
     "CCQUOTA_STOP_SESSION",
@@ -75,6 +76,7 @@ def isolate_cache_db(tmp_path, monkeypatch, isolate_environment):
 
     monkeypatch.setenv("CLAUDE_CACHE_SNAPSHOT_DISABLE", "1")
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data"))
     monkeypatch.setattr(cache_db, "DB_PATH", tmp_path / "isolated-cache.db")
     monkeypatch.setattr(cache_db, "_DATA_DIR", tmp_path / "data")
     monkeypatch.setattr(cache_db, "_LEGACY_CACHE_DIR", tmp_path / "legacy-cache")

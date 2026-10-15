@@ -15,6 +15,7 @@ from pathlib import Path
 import orjson
 
 from ccreport.aggregate import TokenCounts, UsageRecord
+from ccreport.sources import SourceImportWarning
 
 _EVENT_MARKERS = (b'"session_meta"', b'"turn_context"', b'"token_usage_record"', b'"token_count"')
 _USAGE_FIELDS = (
@@ -176,8 +177,10 @@ def parse_rollout_file(path: Path) -> list[UsageRecord]:
                 has_counts = True
 
     if not pending and has_counts:
-        warnings.warn(f"Codex rollout {path.name} has only legacy token_count events; "
-                      "its usage is not imported", RuntimeWarning, stacklevel=2)
+        warnings.warn(SourceImportWarning(
+            f"Codex rollout {path.name} has only legacy token_count events; its usage is not imported",
+            "codex", "Legacy token_count-only logs were skipped.",
+        ), stacklevel=2)
     records: list[UsageRecord] = []
     seen: set[str] = set()
     invalid = 0
@@ -204,13 +207,20 @@ def parse_rollout_file(path: Path) -> list[UsageRecord]:
             if exact_model is None:
                 missing_context += 1
     if invalid:
-        warnings.warn(f"Skipped {invalid} invalid Codex usage record(s) in {path.name}",
-                      RuntimeWarning, stacklevel=2)
+        warnings.warn(SourceImportWarning(
+            f"Skipped {invalid} invalid Codex usage record(s) in {path.name}",
+            "codex", "Invalid usage records were skipped.",
+        ), stacklevel=2)
     if unsupported_writes:
-        warnings.warn(f"Skipped {unsupported_writes} Codex usage record(s) with unsupported "
-                      f"cache-write accounting in {path.name}", RuntimeWarning, stacklevel=2)
+        warnings.warn(SourceImportWarning(
+            f"Skipped {unsupported_writes} Codex usage record(s) with unsupported "
+            f"cache-write accounting in {path.name}",
+            "codex", "Usage with unsupported cache-write accounting was skipped.",
+        ), stacklevel=2)
     if missing_context:
-        warnings.warn(f"{missing_context} Codex usage record(s) in {path.name} lack matching turn_context; "
-                      "model attribution uses the preceding own-thread model, or unknown",
-                      RuntimeWarning, stacklevel=2)
+        warnings.warn(SourceImportWarning(
+            f"{missing_context} Codex usage record(s) in {path.name} lack matching turn_context; "
+            "model attribution uses the preceding own-thread model, or unknown",
+            "codex", "Some model attribution uses earlier context or remains unknown.",
+        ), stacklevel=2)
     return records

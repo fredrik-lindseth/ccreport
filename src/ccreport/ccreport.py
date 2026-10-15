@@ -11,7 +11,9 @@ import json
 import os
 import sys
 import time
-from collections.abc import Callable, Sequence
+import warnings
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -29,6 +31,7 @@ from ccreport import (
     pricing,
     project_identity,
     protocol,
+    sources,
     speed,
     tier_timeline,
 )
@@ -212,8 +215,10 @@ def _keep(
     """
     if override:
         rec.project = override(rec.repo, rec.cwd, rec.project)
-    if rec.source == "codex":
-        rec.account = f"{rec.account_uuid} (ChatGPT)" if rec.account_uuid else "Codex – unknown account"
+    if not sources.is_claude(rec.source):
+        label = "ChatGPT" if rec.source == "codex" else sources.tool_label(rec.source)
+        rec.account = (f"{rec.account_uuid} ({label})" if rec.account_uuid
+                       else f"{sources.tool_label(rec.source)} – unknown account")
     elif accounts is not None:
         rec.account = accounts.label_at(rec.timestamp)
     if since and rec.timestamp < since:
@@ -231,7 +236,7 @@ def _keep(
          rec.tokens.cache_create, rec.tokens.cache_read),
     )
     if key is not None:
-        key = f"codex:{key}" if rec.source == "codex" else key
+        key = key if sources.is_claude(rec.source) else f"{rec.source}:{key}"
         if key in seen_keys:
             return False
         seen_keys.add(key)
@@ -480,12 +485,13 @@ def _build_rollups(
             rec.fx_date().isoformat(),
             rec.session_id, rec.project, rec.model, rec.account,
             rec.source, rec.account_uuid or "", rec.thread_id or "",
+            rec.provider or "",
         )
         t = rec.tokens
         row = rows.get(key)
         if row is None:
             rows[key] = [ts, ts, t.input, t.output, t.cache_create, t.cache_read,
-                         rec.cost(), rec.count, rec.reasoning_output_tokens]
+                         rec.cost(), rec.count, rec.reasoning_output_tokens, rec.reported_cost_usd]
             continue
         row[0] = min(row[0], ts)
         row[1] = max(row[1], ts)
@@ -496,8 +502,10 @@ def _build_rollups(
         row[6] += rec.cost()
         row[7] += rec.count
         row[8] += rec.reasoning_output_tokens
+        if rec.reported_cost_usd is not None:
+            row[9] = (row[9] or 0.0) + rec.reported_cost_usd
     save_ccreport_rollups([
-        (*key[:6], *row[:8], *key[6:], row[8]) for key, row in rows.items()
+        (*key[:6], *row[:8], *key[6:9], row[8], key[9], row[9]) for key, row in rows.items()
     ], fingerprint)
 
 
@@ -516,7 +524,7 @@ def _rollup_records(rows: list[tuple]) -> list[UsageRecord]:
     pairs: list[tuple[float, UsageRecord]] = []
     for (_day, oslo_date, sid, project, model, account,
          min_ts, max_ts, tin, tout, tcc, tcr, cost, n,
-         source, account_uuid, thread_id, reasoning_output_tokens) in rows:
+         source, account_uuid, thread_id, reasoning_output_tokens, provider, reported_cost_usd) in rows:
         pairs.append((min_ts, UsageRecord(
             message_id="",
             model=model,
@@ -536,6 +544,8 @@ def _rollup_records(rows: list[tuple]) -> list[UsageRecord]:
             account_uuid=account_uuid or None,
             thread_id=thread_id or None,
             reasoning_output_tokens=reasoning_output_tokens,
+            provider=provider or None,
+            reported_cost_usd=reported_cost_usd,
         )))
     pairs.sort(key=lambda pair: pair[0])
     return [rec for _min_ts, rec in pairs]
@@ -685,6 +695,29 @@ def _load_with_rollups(files: list[Path], live_paths: set[str]) -> list[UsageRec
 # --- Formatting ---
 
 console = Console(soft_wrap=True)
+
+
+@contextmanager
+def _import_diagnostics(tool: str | None) -> Iterator[list[str]]:
+    """Defer our import diagnostics; leave unrelated Python warnings visible."""
+    notes: list[str] = []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", sources.SourceImportWarning)
+        yield notes
+    for item in caught:
+        warning = item.message
+        if isinstance(warning, sources.SourceImportWarning):
+            if tool is None or warning.source == tool:
+                note = f"{sources.tool_label(warning.source)}: {warning.summary}"
+                if note not in notes:
+                    notes.append(note)
+        else:
+            warnings.warn_explicit(item.message, item.category, item.filename, item.lineno)
+
+
+def _print_import_diagnostics(notes: list[str]) -> None:
+    for note in notes:
+        print(f"Import note: {note}", file=sys.stderr)
 NARROW_WIDTH = 100
 
 
@@ -1288,6 +1321,8 @@ def _json_entry(rec: UsageRecord, nok: NokCtx) -> dict[str, Any]:
         "project": rec.project,
         "account": rec.account,
         "source": rec.source,
+        "provider": rec.provider,
+        "reported_cost_usd": rec.reported_cost_usd,
         "account_uuid": rec.account_uuid,
         "thread_id": rec.thread_id,
         "reasoning_output_tokens": rec.reasoning_output_tokens,
@@ -1298,7 +1333,7 @@ def _json_entry(rec: UsageRecord, nok: NokCtx) -> dict[str, Any]:
         "total_tokens": rec.tokens.total,
         "cost_usd": round(cost, 6),
     }
-    if rec.source == "codex" and not pricing.has_pricing(rec.model, rec.timestamp, source=rec.source):
+    if not rec.is_priced():
         entry["cost_usd"] = None
         return entry
     if nok.enabled:
@@ -1831,7 +1866,7 @@ def cmd_push(args) -> None:
             console.print(
                 f"  {result.unattributed} records without a known account were left here. "
                 "Use [bold]ccreport adopt[/bold] for older Claude history; "
-                "Codex needs an account ID in its log.",
+                "Other tools need a known account identity.",
             )
         for path, detail in result.rejected:
             failed = True
@@ -2795,8 +2830,8 @@ def _plan_archive(min_age_days: int) -> tuple[ArchivePlan, float]:
     for path, raw in records_by_file.items():
         if path in live_paths or path in already:
             continue
-        if any(r.get("source", "claude") == "codex" for r in raw):
-            held_back[path] = "Codex history retained at call grain"
+        if any(not sources.is_claude(r.get("source", "claude")) for r in raw):
+            held_back[path] = "External tool history retained at call grain"
             continue
         kept = [rec for rec in _deserialize_records(raw) if _keep(rec, **filters)]
         stamps = [rec.timestamp.timestamp() for rec in kept]
@@ -2856,7 +2891,7 @@ def _dedup_keys(records: list[UsageRecord]) -> set[str]:
              rec.tokens.cache_create, rec.tokens.cache_read),
         )
         if key is not None:
-            keys.add(f"codex:{key}" if rec.source == "codex" else key)
+            keys.add(key if sources.is_claude(rec.source) else f"{rec.source}:{key}")
     return keys
 
 
@@ -3138,7 +3173,7 @@ def main() -> None:
     # from the environment wins.
     os.environ.setdefault("CLAUDE_CACHE_SNAPSHOT_DEFER", "1")
     parser = argparse.ArgumentParser(
-        description="Analyze Claude Code and Codex token usage and API value from local JSONL logs.",
+        description="Analyze Claude Code, Codex and OpenCode token usage and API value.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
                "  ccreport daily --since 20260201\n"
@@ -3170,7 +3205,7 @@ def main() -> None:
         p.add_argument("--until", help="End date (YYYYMMDD or YYYY-MM-DD)")
         p.add_argument("--project", "-p", help="Filter by project name (substring match)")
         p.add_argument("--account", "-a", help="Filter by account email (substring match)")
-        p.add_argument("--tool", choices=("claude", "codex"), default=argparse.SUPPRESS,
+        p.add_argument("--tool", choices=sources.TOOL_NAMES, default=argparse.SUPPRESS,
                        help="Filter by originating tool")
         p.add_argument("--json", "-j", action="store_true", help="Output as JSON")
         p.add_argument("--no-mva", action="store_true", help="Show NOK without 25%% MVA")
@@ -3333,7 +3368,7 @@ def main() -> None:
     parser.add_argument("--until", help="End date (YYYYMMDD or YYYY-MM-DD)")
     parser.add_argument("--project", "-p", help="Filter by project name")
     parser.add_argument("--account", "-a", help="Filter by account email")
-    parser.add_argument("--tool", choices=("claude", "codex"), help="Filter by originating tool")
+    parser.add_argument("--tool", choices=sources.TOOL_NAMES, help="Filter by originating tool")
     parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
     parser.add_argument("--no-mva", action="store_true", help="Show NOK without 25%% MVA")
     parser.add_argument("--models", "-m", action="store_true",
@@ -3434,22 +3469,23 @@ def main() -> None:
     # depend on which records come back, only on which recent dates the rate
     # cache is still short of, so it runs while the records are being read.
     prefetch = exchange.start_prefetch()
-    records = load_all_records(
-        since=since, until=until,
-        project_filter=project_filter, account_filter=account_filter,
-        # A rollup row is one day of one session, so it can answer a report's
-        # totals and nothing finer. Every filter selects on something it has
-        # aggregated away, and --json prints one entry per API call.
-        use_rollups=not (since or until or project_filter or account_filter
-                         or wants_json),
-        tool_filter=args.tool,
-    )
+    with _import_diagnostics(args.tool) as import_notes:
+        records = load_all_records(
+            since=since, until=until,
+            project_filter=project_filter, account_filter=account_filter,
+            # A rollup row is one day of one session, so it can answer a report's
+            # totals and nothing finer. Every filter selects on something it has
+            # aggregated away, and --json prints one entry per API call.
+            use_rollups=not (since or until or project_filter or account_filter
+                             or wants_json),
+            tool_filter=args.tool,
+        )
 
     # Local rows alone, always. -A merges the pulled tables below; without it
     # they answer the note under each table instead. Either way `ccreport` opens
     # no socket: these are local rows a detached pull wrote.
     remote = _remote_records(since, until, project_filter, account_filter)
-    if args.tool == "codex":
+    if args.tool and not sources.is_claude(args.tool):
         remote = RemoteSpend([], set())
     merge_all = bool(getattr(args, "all", False))
     # `local` stays this machine's own throughout. The session report reads it
@@ -3462,6 +3498,7 @@ def main() -> None:
 
     if not records:
         print("No usage records found.", file=sys.stderr)
+        _print_import_diagnostics(import_notes)
         sys.exit(1)
 
     # Bulk-load exchange rates for all records
@@ -3473,19 +3510,23 @@ def main() -> None:
         # This machine's records alone, whatever -A says: an entry here is one
         # API call, and a pulled row is a day of somebody else's.
         report_json(local, nok=nok)
+        _print_import_diagnostics(import_notes)
         return
 
     command = args.command
     unpriced = sum(
         r.count for r in records
-        if r.source == "codex" and not pricing.has_pricing(r.model, r.timestamp, source=r.source)
+        if not r.is_priced()
     )
     if unpriced:
         console.print(
             f"[yellow]* Cost totals are partial: {unpriced} calls have no verified price.[/yellow]"
         )
-    if any(r.source == "codex" for r in records):
-        console.print("[dim]Codex costs are API Standard value estimates; cache is included in input.[/dim]")
+    external_tools = sorted({
+        sources.tool_label(r.source) for r in records if not sources.is_claude(r.source)
+    })
+    if external_tools:
+        console.print(f"[dim]{', '.join(external_tools)} costs are API Standard value estimates.[/dim]")
 
     def _note() -> None:
         """The gap note, under a table -A could have merged."""
@@ -3532,7 +3573,7 @@ def main() -> None:
         # most of them — pays nothing for the check.
         if _accounts_worth_showing(records):
             report_account(records, nok=nok)
-        if any(r.source == "codex" for r in records):
+        if external_tools:
             render_usage_split(aggregate.model_rows(local, nok), "Models", "Model", nok=nok)
             if merge_all and remote.records:
                 console.print(
@@ -3540,6 +3581,8 @@ def main() -> None:
                 )
             if len({r.source for r in records}) > 1:
                 render_usage_split(aggregate.tool_rows(records, nok), "Tools", "Tool", nok=nok)
+
+    _print_import_diagnostics(import_notes)
 
 
 if __name__ == "__main__":

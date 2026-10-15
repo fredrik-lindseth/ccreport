@@ -120,7 +120,9 @@ CREATE TABLE IF NOT EXISTS server_records (
     req_end       REAL,
     source        TEXT NOT NULL DEFAULT 'claude',
     thread_id     TEXT,
-    reasoning_output_tokens INTEGER NOT NULL DEFAULT 0
+    reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+    provider      TEXT,
+    reported_cost_usd REAL
 );
 
 -- Read-time dedup groups by (account, dedup key): the same call pushed from
@@ -300,7 +302,9 @@ _REC_TOKEN_COLS = ("input_tokens", "output_tokens", "cache_create", "cache_read"
 REC_TIMING_COLS = ("req_start", "req_end")
 """The request span. Behind dup in the physical table."""
 _REC_CODEX_COLS = ("source", "thread_id", "reasoning_output_tokens")
-REC_COLS = (*_REC_SOURCE_COLS, *_REC_FIELD_COLS, *_REC_TOKEN_COLS, *REC_TIMING_COLS, *_REC_CODEX_COLS)
+_REC_PROVIDER_COLS = ("provider", "reported_cost_usd")
+REC_COLS = (*_REC_SOURCE_COLS, *_REC_FIELD_COLS, *_REC_TOKEN_COLS, *REC_TIMING_COLS,
+            *_REC_CODEX_COLS, *_REC_PROVIDER_COLS)
 """Every transmitted record column, preserving existing tuple positions.
 
 The derived dup flag sits before appended source metadata in the physical
@@ -325,6 +329,7 @@ def record_to_row(rec: dict) -> tuple:
         *rec["t"][:len(_REC_TOKEN_COLS)],
         *(rec.get(name) for name in REC_TIMING_COLS),
         rec.get("source", "claude"), rec.get("thread_id"), rec.get("reasoning_output_tokens", 0),
+        *(rec.get(name) for name in _REC_PROVIDER_COLS),
     )
 
 
@@ -334,7 +339,9 @@ def row_to_record(row: tuple) -> dict:
     rec["t"] = list(row[_TOKEN_BASE:_TIMING_BASE])
     codex_base = _TIMING_BASE + len(REC_TIMING_COLS)
     rec.update(zip(REC_TIMING_COLS, row[_TIMING_BASE:codex_base], strict=True))
-    rec.update(zip(_REC_CODEX_COLS, row[codex_base:], strict=True))
+    provider_base = codex_base + len(_REC_CODEX_COLS)
+    rec.update(zip(_REC_CODEX_COLS, row[codex_base:provider_base], strict=True))
+    rec.update(zip(_REC_PROVIDER_COLS, row[provider_base:], strict=True))
     return rec
 
 
@@ -551,6 +558,21 @@ def _add_codex_records(conn: sqlite3.Connection) -> None:
     """)
 
 
+def _add_opencode_records(conn: sqlite3.Connection) -> None:
+    """Preserve provider and untrusted reported accounting separately from API value."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(server_records)")}
+    for name, ddl in (("provider", "TEXT"), ("reported_cost_usd", "REAL")):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE server_records ADD COLUMN {name} {ddl}")
+    conn.execute("DROP INDEX IF EXISTS idx_srec_group")
+    conn.execute("""
+        CREATE INDEX idx_srec_group ON server_records(
+            dup, machine_id, account_uuid, account_label, project, model, day, oslo_date, source, provider,
+            ts, cost, input_tokens, output_tokens, cache_create, cache_read, dk, id,
+            reasoning_output_tokens, req_start, req_end, reported_cost_usd)
+    """)
+
+
 MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(4, "machines.label_updated_at", _add_label_updated_at),
     migrations.Step(5, "project_aliases"),
@@ -561,6 +583,7 @@ MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(10, "server_records.dup", _add_dup_column),
     migrations.Step(11, "server_records.req_start/req_end, server_turns", _add_request_timing),
     migrations.Step(12, "server_records.codex", _add_codex_records),
+    migrations.Step(13, "server_records.opencode", _add_opencode_records),
 )
 """Every schema change since MIGRATION_BASELINE, in the order they are applied.
 

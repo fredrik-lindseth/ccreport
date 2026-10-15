@@ -165,7 +165,7 @@ _ROLLUP_ROW = (
     40,
     1.5,
     7,
-    "claude", "", "", 0,
+    "claude", "", "", 0, "", None,
 )
 
 
@@ -991,6 +991,8 @@ class TestCcreportRows:
         values = dict(zip(_CCR_COLS, stored, strict=True))
         assert values.pop("account_uuid") is None
         assert values.pop("thread_id") is None
+        assert values.pop("provider") is None
+        assert values.pop("reported_cost_usd") is None
         assert all(v is not None for v in values.values())
 
     def test_the_record_dict_matches_the_column_tuple(self, db):
@@ -1014,6 +1016,10 @@ class TestCcreportRows:
         timing_at = len(cache_db._CCR_FIELD_COLS) + len(cache_db._CCR_TOKEN_COLS)
         expected.update({
             name: timing_at + i for i, name in enumerate(cache_db._CCR_TIMING_COLS)
+        })
+        provider_at = timing_at + len(cache_db._CCR_TIMING_COLS)
+        expected.update({
+            name: provider_at + i for i, name in enumerate(cache_db._CCR_PROVIDER_COLS)
         })
         assert record == expected
 
@@ -3389,7 +3395,55 @@ class TestCodexCache:
         assert cache_db.load_ccreport_rollups() == []
 
     def test_rollup_keeps_provider_and_account_identities(self, db):
-        codex = (*_ROLLUP_ROW[:14], "codex", "account-a", "thread-1", 3)
-        other = (*_ROLLUP_ROW[:14], "codex", "account-b", "thread-1", 4)
+        codex = (*_ROLLUP_ROW[:14], "codex", "account-a", "thread-1", 3, "", None)
+        other = (*_ROLLUP_ROW[:14], "codex", "account-b", "thread-1", 4, "", None)
         cache_db.save_ccreport_rollups([_ROLLUP_ROW, codex, other], "codex")
         assert set(cache_db.load_ccreport_rollups()) == {_ROLLUP_ROW, codex, other}
+
+
+class TestOpenCodeCache:
+    @pytest.mark.parametrize("reported", [None, 0.0, 1.25])
+    def test_provider_and_reported_cost_roundtrip(self, db, reported):
+        from ccreport import scan
+        from ccreport.aggregate import TokenCounts, UsageRecord
+
+        record = UsageRecord(
+            message_id="response", model="provider-model", tokens=TokenCounts(10, 7, 0, 3),
+            timestamp=datetime(2026, 6, 15, tzinfo=UTC), session_id="session", project="project",
+            source="opencode", provider="custom-provider", reported_cost_usd=reported,
+        )
+        raw = scan._serialize_records([record])
+        save_ccreport_file("/virtual/opencode/session.jsonl", 123, 456, raw)
+        restored = scan._deserialize_records(bulk_load_ccreport_cache()[1]["/virtual/opencode/session.jsonl"])
+        assert restored == [record]
+        assert restored[0].reported_cost_usd is reported or restored[0].reported_cost_usd == reported
+
+    def test_v17_upgrade_preserves_claude_timing_and_codex_metadata(self, db):
+        rows = [
+            TestCcreportRows.RECORD,
+            {**TestCcreportRows.RECORD, "mid": "codex-response", "source": "codex",
+             "account_uuid": "codex-account", "thread_id": "codex-thread", "reasoning_output_tokens": 1},
+        ]
+        save_ccreport_file("/history/a.jsonl", 1, 2, rows)
+        for name in ("provider", "reported_cost_usd"):
+            db.execute(f"ALTER TABLE ccreport_records DROP COLUMN {name}")
+        db.execute("DELETE FROM schema_migrations WHERE version = 18")
+        db.execute("PRAGMA user_version = 17")
+        db.commit()
+        cache_db.close_connection()
+        upgraded = cache_db.get_connection()
+        assert upgraded.execute("PRAGMA user_version").fetchone() == (18,)
+        assert upgraded.execute(
+            "SELECT mid,source,thread_id,req_start,req_end,provider,reported_cost_usd "
+            "FROM ccreport_records ORDER BY id"
+        ).fetchall() == [
+            ("m1", "claude", None, 0.5, 1.5, None, None),
+            ("codex-response", "codex", "codex-thread", 0.5, 1.5, None, None),
+        ]
+
+    def test_rollup_keeps_providers_and_nullable_reported_amount(self, db):
+        base = (*_ROLLUP_ROW[:14], "opencode", "", "", 0)
+        a = (*base, "provider-a", None)
+        b = (*base, "provider-b", 0.0)
+        cache_db.save_ccreport_rollups([a, b], "opencode")
+        assert set(cache_db.load_ccreport_rollups()) == {a, b}
