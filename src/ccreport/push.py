@@ -475,12 +475,16 @@ def pseudo_session(salt: str, session_id: str) -> str:
     return hashlib.sha256(f"{salt}\x00session\x00{session_id}".encode()).hexdigest()[:16]
 
 
-REDACTION_SHAPE = "null-identity-with-thread"
+REDACTION_SHAPE = "null-identity"
 """What redact() leaves of an unallowed record, as a value policy_hash moves on.
 
 The salt no longer changes when the redaction does — nothing derives from it
 since the pseudonyms went — so this string is the only thing that can force the
-re-push a shape change needs. Change what redact() strips, change this.
+re-push a shape change needs. Change what redact() strips, change this — when
+the change reaches a record a server already holds. The thread_id null-out did
+not: the field arrived with the Codex and OpenCode records, which no server had
+seen under the old shape, so no pushed byte moved and a bump here would have
+cost every connected machine its whole corpus for nothing.
 """
 
 

@@ -1226,11 +1226,15 @@ class TestExcludeInThePolicyHash:
             _server(allow=(), exclude=("a",)),
         )
 
-    def test_an_empty_list_leaves_an_existing_digest_where_it_was(self, monkeypatch):
-        """The key arriving must not charge every configured machine a corpus."""
-        # Compare the same redaction shape; adding thread redaction deliberately
-        # changes that independent input to the policy digest.
-        monkeypatch.setattr(push, "REDACTION_SHAPE", "null-identity")
+    def test_an_empty_list_leaves_an_existing_digest_where_it_was(self):
+        """The key arriving must not charge every configured machine a corpus.
+
+        The digest is pinned against the shipped REDACTION_SHAPE on purpose: a
+        bump there re-pushes every machine's whole corpus, so it has to be a
+        deliberate edit here as well. The thread_id null-out did not need one --
+        no server held a record carrying the field under the old shape.
+        """
+        assert push.REDACTION_SHAPE == "null-identity"
         assert push.policy_hash(_server(exclude=())) == "23ba203fcb6c1e97"
 
 

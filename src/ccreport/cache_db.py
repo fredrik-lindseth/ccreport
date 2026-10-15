@@ -2743,8 +2743,8 @@ def bulk_load_ccreport_cache(
     if not _ccreport_readable(conn):
         return {}, {}
     file_rows = conn.execute(
-        "SELECT path, mtime_ns, size FROM ccreport_files f WHERE ? IS NULL OR EXISTS "
-        "(SELECT 1 FROM ccreport_records r WHERE r.file_id = f.id AND r.source = ?)",
+        "SELECT path, mtime_ns, size FROM ccreport_files f WHERE ? IS NULL OR NOT EXISTS "
+        "(SELECT 1 FROM ccreport_records r WHERE r.file_id = f.id AND r.source != ?)",
         (source, source),
     ).fetchall()
     file_meta = {r[0]: (r[1], r[2]) for r in file_rows}
@@ -2774,8 +2774,8 @@ def load_ccreport_file_meta(*, source: str | None = None) -> dict[str, tuple[int
     return {
         row[0]: (row[1], row[2])
         for row in conn.execute(
-            "SELECT path, mtime_ns, size FROM ccreport_files f WHERE ? IS NULL OR EXISTS "
-            "(SELECT 1 FROM ccreport_records r WHERE r.file_id = f.id AND r.source = ?)",
+            "SELECT path, mtime_ns, size FROM ccreport_files f WHERE ? IS NULL OR NOT EXISTS "
+            "(SELECT 1 FROM ccreport_records r WHERE r.file_id = f.id AND r.source != ?)",
             (source, source),
         )
     }

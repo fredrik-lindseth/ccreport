@@ -3374,6 +3374,25 @@ class TestCodexCache:
         assert set(cache_db.load_ccreport_file_meta(source="claude")) == {"/claude/a.jsonl"}
         assert {r[0] for r in cache_db.load_ccreport_file_identities(source="claude")} == {"/claude/a.jsonl"}
 
+    def test_a_claude_file_with_no_records_stays_in_the_file_meta(self, db):
+        """Half a real cache is files that logged no call: summaries, sidecars,
+        sessions that never reached the model. The status line reads the meta
+        to decide a file is unchanged, so one missing here is re-parsed on
+        every slow render. The filter keeps a file unless a record of another
+        source says it belongs elsewhere."""
+        save_ccreport_file("/claude/empty.jsonl", 5, 0, [])
+        save_ccreport_file("/claude/a.jsonl", 1, 2, [TestCcreportRows.RECORD])
+        codex = {**TestCcreportRows.RECORD, "source": "codex", "account_uuid": "account",
+                 "thread_id": "thread", "reasoning_output_tokens": 1}
+        save_ccreport_file("/codex/rollout.jsonl", 3, 4, [codex])
+        expected = {"/claude/empty.jsonl": (5, 0), "/claude/a.jsonl": (1, 2)}
+        assert cache_db.load_ccreport_file_meta(source="claude") == expected
+        assert bulk_load_ccreport_cache(source="claude")[0] == expected
+        assert set(cache_db.load_ccreport_file_meta(source="codex")) == {
+            "/claude/empty.jsonl", "/codex/rollout.jsonl",
+        }
+        assert set(cache_db.load_ccreport_file_meta()) == {*expected, "/codex/rollout.jsonl"}
+
     def test_archive_refuses_codex_without_deleting_records(self, db):
         record = {**TestCcreportRows.RECORD, "source": "codex", "account_uuid": "account",
                   "thread_id": "thread", "reasoning_output_tokens": 1}
