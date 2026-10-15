@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Development
+
+- **The status line energy benchmark sees its push child on every run.** Against a closed port the child had nothing to send and no account to pull for, so it made no request and was gone in 50 ms, under one `ps` sample beside a parallel test run, which failed `test_a_cold_render_is_seen_spawning_both` under `just test`. The bench home now seeds one account capture so the push posts, its push target holds the connection for a second before closing without a byte, and the render gets XDG roots of its own under the bench HOME rather than whatever the shell exports.
+
 ## 0.2.0 (2026-10-15)
 
 ### Added
