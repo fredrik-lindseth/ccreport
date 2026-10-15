@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import time
 from datetime import UTC, datetime, timedelta
+from typing import Literal, Self
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from ccreport import exchange, pricing, protocol
 from ccreport.server import db, pull, tokens
@@ -52,10 +53,13 @@ class IngestRecord(BaseModel):
     repo: str | None = None
     dk: str | None = None
     cost: float | None = None
-    input_tokens: int = 0
-    output_tokens: int = 0
-    cache_create: int = 0
-    cache_read: int = 0
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    cache_create: int = Field(default=0, ge=0)
+    cache_read: int = Field(default=0, ge=0)
+    source: Literal["claude", "codex"] = "claude"
+    thread_id: str | None = None
+    reasoning_output_tokens: int = Field(default=0, ge=0)
     account_uuid: str
     account_label: str | None = None
     req_start: float | None = None
@@ -65,6 +69,16 @@ class IngestRecord(BaseModel):
     order — which is why the client derives it and the server cannot. Absent
     from a client before protocol 3, and stored NULL then."""
 
+
+    @model_validator(mode="after")
+    def valid_codex_tokens(self) -> Self:
+        """Reasoning is an output subset; Codex has no cache-write counter."""
+        if self.source == "codex":
+            if self.reasoning_output_tokens > self.output_tokens:
+                raise ValueError("reasoning_output_tokens must not exceed output_tokens")
+            if self.cache_create:
+                raise ValueError("Codex cache_create is unsupported")
+        return self
 
 class IngestTurn(BaseModel):
     """One `turn_duration` line: a whole turn, prompt to done.
@@ -80,6 +94,8 @@ class IngestTurn(BaseModel):
     model: str
     duration_ms: int
     account_uuid: str
+
+
 
 
 class IngestFile(BaseModel):
@@ -321,7 +337,7 @@ def _priced(rec: IngestRecord) -> float:
     # A pseudo-model — "<synthetic>" — is a record Claude Code wrote for its own
     # bookkeeping. It has no price because it had no call, which is a known
     # zero rather than an unknown one.
-    if pricing.find_pricing(rec.model, when) is None and not rec.model.startswith("<"):
+    if not pricing.has_pricing(rec.model, when, source=rec.source):
         raise LookupError(rec.model)
     return pricing.calc_cost(
         rec.input_tokens, rec.output_tokens, rec.cache_create, rec.cache_read,
@@ -350,6 +366,9 @@ def _row(machine_id: str, path: str, rec: IngestRecord) -> tuple:
         "file_path": path,
         "account_uuid": rec.account_uuid,
         "account_label": rec.account_label,
+        "source": rec.source,
+        "thread_id": rec.thread_id,
+        "reasoning_output_tokens": rec.reasoning_output_tokens,
         "mid": rec.mid,
         "model": rec.model,
         "ts": rec.ts,

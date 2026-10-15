@@ -30,6 +30,7 @@ def _record(**over) -> dict:
         "dk": "msg_1:req_1", "cost": 1.25, "log_cost": None,
         "t": [10, 20, 30, 40],
         "req_start": 1_699_999_990.0, "req_end": 1_700_000_000.0,
+        "source": "claude", "thread_id": None, "reasoning_output_tokens": 0,
     }
     rec.update(over)
     return rec
@@ -43,7 +44,7 @@ class TestSchema:
         one and not the other shifts every insert one place and lands here.
         """
         cols = [row[1] for row in conn.execute("PRAGMA table_info(server_records)")]
-        assert cols == ["id", *db.REC_COLS[:-2], "dup", *db.REC_TIMING_COLS]
+        assert cols == ["id", *db.REC_COLS[:-5], "dup", *db.REC_COLS[-5:]]
 
     @pytest.mark.parametrize(
         ("table", "cols"),
@@ -121,9 +122,9 @@ class TestSchema:
         """On idx_srec_acct_ts it reads the account's every row per chunk: 1.52s
         against 0.37s over 800,000, and no ANALYZE may exist here to fix it."""
         plan = str(conn.execute(
-            "EXPLAIN QUERY PLAN " + db._RECONCILE_SQL % "(?, ?)", ("acct", "dk"),
+            "EXPLAIN QUERY PLAN " + db._RECONCILE_SQL % "(?, ?, ?)", ("acct", "claude", "dk"),
         ).fetchall())
-        assert "idx_srec_account_dk" in plan, plan
+        assert "idx_srec_source_dk" in plan, plan
         assert "idx_srec_acct_ts" not in plan, plan
 
     def test_the_group_index_leads_with_the_dedup_flag(self, conn):
@@ -167,26 +168,33 @@ class TestSchema:
         finally:
             second.close()
 
-    def test_a_database_written_before_request_timing_gains_it_empty(self, tmp_path):
-        """The span is read off a log's line order, which the server never had,
-        so the step adds the columns and the turns table and backfills nothing:
-        a stored row stays untimed until its machine re-pushes the file."""
+    def test_a_database_written_before_request_timing_gains_it_empty(self, tmp_path, monkeypatch):
+        """An old server gains timing and source columns without inventing a span."""
         path = tmp_path / "server.db"
-        first = db.connect(path)
-        db.upsert_machine(first, "m1", "m1", 100.0)
-        db.replace_file_records(
-            first, "m1", "/p/a.jsonl", 1, 10, [db.record_to_row(_record())], 500.0,
-        )
-        first.execute("DROP TABLE server_turns")
-        for col in db.REC_TIMING_COLS:
-            first.execute(f"ALTER TABLE server_records DROP COLUMN {col}")
-        first.execute("PRAGMA user_version = 10")
-        first.close()
+        old_schema = db._SCHEMA_SQL
+        first_new = old_schema.index("    -- The request's span")
+        last_new = old_schema.index("\n);", first_new)
+        old_schema = old_schema[:first_new].rstrip().removesuffix(",") + old_schema[last_new:]
+        with monkeypatch.context() as old:
+            old.setattr(db, "_SCHEMA_SQL", old_schema)
+            old.setattr(db, "MIGRATION_CHAIN", db.MIGRATION_CHAIN[:-2])
+            old.setattr(db, "SCHEMA_VERSION", 10)
+            first = db.connect(path)
+            db.upsert_machine(first, "m1", "m1", 100.0)
+            cols = db.REC_COLS[:20]
+            placeholders = ", ".join("?" for _ in cols)
+            first.execute(
+                f"INSERT INTO server_records ({', '.join(cols)}) VALUES ({placeholders})",
+                db.record_to_row(_record())[:20],
+            )
+            first.execute("DROP TABLE server_turns")
+            first.commit()
+            first.close()
 
         second = db.connect(path)
         try:
             cols = [row[1] for row in second.execute("PRAGMA table_info(server_records)")]
-            assert cols == ["id", *db.REC_COLS[:-2], "dup", *db.REC_TIMING_COLS]
+            assert cols == ["id", *db.REC_COLS[:-5], "dup", *db.REC_COLS[-5:]]
             rec = db.load_file_records(second, "m1", "/p/a.jsonl")[0]
             assert (rec["mid"], rec["req_start"], rec["req_end"]) == ("msg_1", None, None)
             assert [row[1] for row in second.execute("PRAGMA table_info(server_turns)")] == list(
@@ -325,8 +333,9 @@ class TestRecordRows:
         row = db.record_to_row(_record())
         assert row[db.REC_COLS.index("cost")] == 1.25
         assert row[db.REC_COLS.index("machine_id")] == "m1"
-        assert row[-6:-2] == (10, 20, 30, 40)
-        assert row[-2:] == (1_699_999_990.0, 1_700_000_000.0)
+        assert row[16:20] == (10, 20, 30, 40)
+        assert row[-3:] == ("claude", None, 0)
+        assert row[20:22] == (1_699_999_990.0, 1_700_000_000.0)
 
     def test_a_missing_field_becomes_null_rather_than_a_key_error(self):
         """The pusher omits what a redacted project strips; that is not an error."""
@@ -532,7 +541,7 @@ class TestDedupFlag:
         rows = [db.record_to_row(_record(mid=f"msg_{n}", dk=f"dk_{n}")) for n in range(20)]
         self._push(conn, "m1", rows)
         before = conn.total_changes
-        db._reconcile_dup(conn, {("acct-1", f"dk_{n}") for n in range(20)})
+        db._reconcile_dup(conn, {("acct-1", "claude", f"dk_{n}") for n in range(20)})
         assert conn.total_changes == before
 
     def test_more_keys_than_one_statement_holds_are_all_flagged(self, conn):

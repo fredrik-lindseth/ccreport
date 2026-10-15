@@ -475,7 +475,7 @@ def pseudo_session(salt: str, session_id: str) -> str:
     return hashlib.sha256(f"{salt}\x00session\x00{session_id}".encode()).hexdigest()[:16]
 
 
-REDACTION_SHAPE = "null-identity"
+REDACTION_SHAPE = "null-identity-with-thread"
 """What redact() leaves of an unallowed record, as a value policy_hash moves on.
 
 The salt no longer changes when the redaction does — nothing derives from it
@@ -505,7 +505,10 @@ def redact(rec: dict, server: ServerConfig) -> dict:
     project = rec["project"]
     if project not in server.exclude and (not server.restricted or project in server.allow):
         return rec
-    return {**rec, "project": None, "cwd": None, "repo": None, "sid": None}
+    stripped = {**rec, "project": None, "cwd": None, "repo": None, "sid": None}
+    if "thread_id" in stripped:
+        stripped["thread_id"] = None
+    return stripped
 
 
 def policy_hash(server: ServerConfig, override_rules: object = "") -> str:
@@ -729,7 +732,12 @@ def _payload_record(rec: dict, timeline, override) -> dict | None:
     None where the change log covers neither — see _attribution.
     """
     when = datetime.fromtimestamp(rec["ts"], tz=UTC)
-    account = _attribution(timeline, when)
+    source = rec.get("source", "claude")
+    if source == "codex":
+        uuid = rec.get("account_uuid")
+        account = {"account_uuid": uuid, "account_label": f"{uuid} (ChatGPT)"} if uuid else None
+    else:
+        account = _attribution(timeline, when)
     if account is None:
         return None
     local = when.astimezone()
@@ -758,6 +766,9 @@ def _payload_record(rec: dict, timeline, override) -> dict | None:
         # sees, so it travels as this machine derived it.
         "req_start": rec["req_start"],
         "req_end": rec["req_end"],
+        "source": source,
+        "thread_id": rec.get("thread_id"),
+        "reasoning_output_tokens": rec.get("reasoning_output_tokens", 0),
         **account,
     }
 

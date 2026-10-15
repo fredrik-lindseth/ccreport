@@ -203,7 +203,11 @@ CREATE TABLE IF NOT EXISTS ccreport_records (
     -- the same pair. NULL where the log could not say, and on every row parsed
     -- before the columns arrived whose log is gone.
     req_start     REAL,
-    req_end       REAL
+    req_end       REAL,
+    source        TEXT NOT NULL DEFAULT 'claude',
+    account_uuid  TEXT,
+    thread_id     TEXT,
+    reasoning_output_tokens INTEGER NOT NULL DEFAULT 0
 );
 
 -- One row per `turn_duration` line: a whole turn, prompt to done, tool runs and
@@ -219,6 +223,7 @@ CREATE TABLE IF NOT EXISTS ccreport_turns (
     sid         TEXT NOT NULL,
     model       TEXT NOT NULL,   -- the last reply's before the line; it names none
     duration_ms INTEGER NOT NULL
+
 );
 
 -- Per-day aggregates of the records ccreport has already read, for the days
@@ -252,7 +257,11 @@ CREATE TABLE IF NOT EXISTS ccreport_rollups (
     cache_read    INTEGER NOT NULL,
     cost          REAL NOT NULL,
     n             INTEGER NOT NULL,
-    PRIMARY KEY (day, oslo_date, sid, project, model, account)
+    source        TEXT NOT NULL DEFAULT 'claude',
+    account_uuid  TEXT NOT NULL DEFAULT '',
+    thread_id     TEXT NOT NULL DEFAULT '',
+    reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, oslo_date, sid, project, model, account, source, account_uuid, thread_id)
 ) WITHOUT ROWID;
 
 -- The all-time cost of every record whose source JSONL is gone, pre-summed.
@@ -1160,12 +1169,30 @@ def _migrate_request_timing(conn: sqlite3.Connection) -> None:
             )
 
 
+def _migrate_codex_records(conn: sqlite3.Connection) -> None:
+    """Keep provider identity and Codex reasoning tokens across cache reads."""
+    for name, declaration in (
+        ("source", "TEXT NOT NULL DEFAULT 'claude'"),
+        ("account_uuid", "TEXT"), ("thread_id", "TEXT"),
+        ("reasoning_output_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if name not in _table_columns(conn, "ccreport_records"):
+            conn.execute(f"ALTER TABLE ccreport_records ADD COLUMN {name} {declaration}")
+    # Derived rows can be rebuilt; the new identity belongs in their primary key.
+    conn.execute("DROP TABLE ccreport_rollups")
+    start = _SCHEMA_SQL.index("CREATE TABLE IF NOT EXISTS ccreport_rollups (")
+    end = _SCHEMA_SQL.index(";", start) + 1
+    conn.execute(_SCHEMA_SQL[start:end])
+    conn.execute("DELETE FROM meta WHERE key = 'ccreport_rollup_fp'")
+
+
 MIGRATION_CHAIN: tuple[migrations.Step, ...] = (
     migrations.Step(12, "ccreport_records_file_id", _migrate_records_file_id),
     migrations.Step(13, "ccreport_archive", _migrate_files_archived),
     migrations.Step(14, "remote_costs"),
     migrations.Step(15, "account_events.source", _migrate_account_source),
     migrations.Step(16, "request_timing", _migrate_request_timing),
+    migrations.Step(17, "codex_records", _migrate_codex_records),
 )
 """Every schema change since MIGRATION_BASELINE, in the order they are applied.
 
@@ -2410,7 +2437,7 @@ def write_session_cost(session_id: str, fingerprint: str, cost: float) -> None:
 
 # Bump this when schema or serialization changes in cache_db.py affect
 # the format of stored ccreport records.
-CACHE_SCHEMA_SALT = "3"
+CACHE_SCHEMA_SALT = "4"
 
 
 def check_ccreport_valid(version: int, script_hash: str) -> bool:
@@ -2531,7 +2558,9 @@ def init_ccreport_meta(version: int, script_hash: str) -> None:
 # straight off the dict by column name.
 _CCR_FIELD_COLS = (
     "mid", "model", "ts", "sid", "project", "cwd", "repo", "dk", "cost",
+    "source", "account_uuid", "thread_id", "reasoning_output_tokens",
 )
+_CCR_FIELD_DEFAULTS = {"source": "claude", "reasoning_output_tokens": 0}
 _CCR_TOKEN_COLS = ("input_tokens", "output_tokens", "cache_create", "cache_read")
 # After the tokens rather than among the fields, so the positions
 # _group_by_file reads the tokens at did not move when these arrived.
@@ -2554,7 +2583,8 @@ def _ccr_record_to_row(file_id: int, rec: dict) -> tuple:
     """A record dict as an insert row for _CCR_INSERT_COLS."""
     return (
         file_id,
-        *(rec.get(name) for name in _CCR_FIELD_COLS),
+        *(rec.get(name, _CCR_FIELD_DEFAULTS.get(name))
+          for name in _CCR_FIELD_COLS),
         *rec["t"][:len(_CCR_TOKEN_COLS)],
         *(rec.get(name) for name in _CCR_TIMING_COLS),
     )
@@ -2578,8 +2608,11 @@ def _group_by_file(rows: list[tuple]) -> dict[str, list[dict]]:
         grouped.setdefault(row[0], []).append({
             "mid": row[1], "model": row[2], "ts": row[3], "sid": row[4],
             "project": row[5], "cwd": row[6], "repo": row[7], "dk": row[8],
-            "cost": row[9], "t": [row[10], row[11], row[12], row[13]],
-            "req_start": row[14], "req_end": row[15],
+            "cost": row[9], "t": [row[14], row[15], row[16], row[17]],
+            "req_start": row[18], "req_end": row[19],
+            **({"source": row[10], "account_uuid": row[11], "thread_id": row[12],
+                "reasoning_output_tokens": row[13]}
+               if row[10] != "claude" or row[11] is not None or row[12] is not None or row[13] else {}),
         })
     return grouped
 
@@ -2603,7 +2636,7 @@ def prefix_range(prefix: str) -> tuple[str, str]:
     return prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)
 
 
-def load_ccreport_records_under(prefix: str) -> dict[str, list[dict]]:
+def load_ccreport_records_under(prefix: str, *, source: str | None = None) -> dict[str, list[dict]]:
     """Cached records whose file path starts with *prefix*, as {path: [record]}.
 
     The statusline renders one project at a time and threw away everything else
@@ -2620,8 +2653,8 @@ def load_ccreport_records_under(prefix: str) -> dict[str, list[dict]]:
     lo, hi = prefix_range(prefix)
     return _group_by_file(conn.execute(
         f"SELECT f.path, {_CCR_SELECT} {_CCR_FROM} "
-        f"WHERE f.path >= ? AND f.path < ?",
-        (lo, hi),
+        f"WHERE f.path >= ? AND f.path < ? AND (? IS NULL OR r.source = ?)",
+        (lo, hi, source, source),
     ).fetchall())
 
 
@@ -2652,7 +2685,7 @@ def load_ccreport_file_meta_under(prefix: str) -> dict[str, tuple[int, int]]:
     }
 
 
-def load_ccreport_records_for_session(session_id: str) -> dict[str, list[dict]]:
+def load_ccreport_records_for_session(session_id: str, *, source: str | None = None) -> dict[str, list[dict]]:
     """Cached records for one session id, as {path: [record]}.
 
     Answers the purged-JSONL fallback in compute_session_cost, which used to
@@ -2667,12 +2700,15 @@ def load_ccreport_records_for_session(session_id: str) -> dict[str, list[dict]]:
     if not _ccreport_readable(conn):
         return {}
     return _group_by_file(conn.execute(
-        f"SELECT f.path, {_CCR_SELECT} {_CCR_FROM} WHERE r.sid = ?",
-        (session_id,),
+        f"SELECT f.path, {_CCR_SELECT} {_CCR_FROM} WHERE r.sid = ? "
+        "AND (? IS NULL OR r.source = ?)",
+        (session_id, source, source),
     ).fetchall())
 
 
-def bulk_load_ccreport_cache() -> tuple[dict[str, tuple[int, int]], dict[str, list[dict]]]:
+def bulk_load_ccreport_cache(
+    *, source: str | None = None,
+) -> tuple[dict[str, tuple[int, int]], dict[str, list[dict]]]:
     """Bulk-load all ccreport file metadata and records.
 
     Returns (file_meta, records_by_file) where:
@@ -2686,17 +2722,22 @@ def bulk_load_ccreport_cache() -> tuple[dict[str, tuple[int, int]], dict[str, li
     conn = get_connection()
     if not _ccreport_readable(conn):
         return {}, {}
-    file_rows = conn.execute("SELECT path, mtime_ns, size FROM ccreport_files").fetchall()
+    file_rows = conn.execute(
+        "SELECT path, mtime_ns, size FROM ccreport_files f WHERE ? IS NULL OR EXISTS "
+        "(SELECT 1 FROM ccreport_records r WHERE r.file_id = f.id AND r.source = ?)",
+        (source, source),
+    ).fetchall()
     file_meta = {r[0]: (r[1], r[2]) for r in file_rows}
     if not file_meta:
         return {}, {}
     rec_rows = conn.execute(
-        f"SELECT f.path, {_CCR_SELECT} {_CCR_FROM}"
+        f"SELECT f.path, {_CCR_SELECT} {_CCR_FROM} WHERE (? IS NULL OR r.source = ?)",
+        (source, source),
     ).fetchall()
     return file_meta, _group_by_file(rec_rows)
 
 
-def load_ccreport_file_meta() -> dict[str, tuple[int, int]]:
+def load_ccreport_file_meta(*, source: str | None = None) -> dict[str, tuple[int, int]]:
     """Cached (mtime_ns, size) for every cached file, machine-wide.
 
     The unscoped twin of load_ccreport_file_meta_under, for the rollup read
@@ -2712,11 +2753,15 @@ def load_ccreport_file_meta() -> dict[str, tuple[int, int]]:
         return {}
     return {
         row[0]: (row[1], row[2])
-        for row in conn.execute("SELECT path, mtime_ns, size FROM ccreport_files")
+        for row in conn.execute(
+            "SELECT path, mtime_ns, size FROM ccreport_files f WHERE ? IS NULL OR EXISTS "
+            "(SELECT 1 FROM ccreport_records r WHERE r.file_id = f.id AND r.source = ?)",
+            (source, source),
+        )
     }
 
 
-def load_ccreport_records_since(cutoff_ts: float) -> dict[str, list[dict]]:
+def load_ccreport_records_since(cutoff_ts: float, *, source: str | None = None) -> dict[str, list[dict]]:
     """Cached records at or after *cutoff_ts*, as {path: [record]}.
 
     One scan covers live and orphaned files alike, which is what lets the
@@ -2737,8 +2782,8 @@ def load_ccreport_records_since(cutoff_ts: float) -> dict[str, list[dict]]:
         return {}
     return _group_by_file(conn.execute(
         f"SELECT f.path, {_CCR_SELECT} {_CCR_FROM} "
-        "WHERE r.ts >= ? ORDER BY r.id",
-        (cutoff_ts,),
+        "WHERE r.ts >= ? AND (? IS NULL OR r.source = ?) ORDER BY r.id",
+        (cutoff_ts, source, source),
     ).fetchall())
 
 
@@ -2806,7 +2851,9 @@ def load_ccreport_turns(
 _ORPHAN_FP_KEY = "ccreport_orphan_fp"
 
 
-def load_ccreport_records_for_paths(paths: Iterable[str]) -> dict[str, list[dict]]:
+def load_ccreport_records_for_paths(
+    paths: Iterable[str], *, source: str | None = None,
+) -> dict[str, list[dict]]:
     """Cached records belonging to *paths*, as {path: [record]}.
 
     For rebuilding the orphan all-time totals: the caller has already worked
@@ -2832,8 +2879,8 @@ def load_ccreport_records_for_paths(paths: Iterable[str]) -> dict[str, list[dict
         placeholders = ",".join("?" * len(chunk))
         rows.extend(conn.execute(
             f"SELECT r.id, f.path, {_CCR_SELECT} {_CCR_FROM} "
-            f"WHERE f.path IN ({placeholders})",
-            chunk,
+            f"WHERE f.path IN ({placeholders}) AND (? IS NULL OR r.source = ?)",
+            (*chunk, source, source),
         ))
     rows.sort(key=itemgetter(0))
     return _group_by_file([row[1:] for row in rows])
@@ -2956,7 +3003,9 @@ def load_file_all_time_under(prefix: str) -> dict[str, tuple[int, int, float, li
 _ARCHIVED_PATH_LEAF = "\x00archived.jsonl"
 
 
-def load_ccreport_file_identities() -> list[tuple[str, str | None, str | None, str]]:
+def load_ccreport_file_identities(
+    *, source: str | None = None,
+) -> list[tuple[str, str | None, str | None, str]]:
     """(file_path, repo, cwd, project) for every cached file, one row each.
 
     Answers "which files belong to the same project as this one" without
@@ -2986,14 +3035,17 @@ def load_ccreport_file_identities() -> list[tuple[str, str | None, str | None, s
         for row in conn.execute(
             "SELECT f.path, r.repo, r.cwd, r.project "
             "FROM ccreport_records r JOIN ccreport_files f ON f.id = r.file_id "
-            "GROUP BY r.file_id"
+            "WHERE (? IS NULL OR r.source = ?) GROUP BY r.file_id",
+            (source, source),
         ).fetchall()
     ]
     rows += [
         (row[0] + _ARCHIVED_PATH_LEAF, row[1] or None, row[2] or None, row[3])
         for row in conn.execute(
             "SELECT dir_prefix, repo, cwd, project FROM ccreport_archive "
-            "WHERE dir_prefix != '' GROUP BY dir_prefix, repo, cwd, project"
+            "WHERE dir_prefix != '' AND (? IS NULL OR ? = 'claude') "
+            "GROUP BY dir_prefix, repo, cwd, project",
+            (source, source),
         ).fetchall()
     ]
     return rows
@@ -3202,7 +3254,7 @@ _CCR_ROLLUP_COLS = (
     "day", "oslo_date", "sid", "project", "model", "account",
     "min_ts", "max_ts",
     "input_tokens", "output_tokens", "cache_create", "cache_read",
-    "cost", "n",
+    "cost", "n", "source", "account_uuid", "thread_id", "reasoning_output_tokens",
 )
 _CCR_ROLLUP_SELECT = ", ".join(_CCR_ROLLUP_COLS)
 _CCR_ROLLUP_PLACEHOLDERS = ", ".join("?" * len(_CCR_ROLLUP_COLS))
@@ -3338,6 +3390,13 @@ def save_ccreport_archive(rows: list[tuple], paths: set[str]) -> int:
     conn.execute("BEGIN IMMEDIATE")
     deleted = 0
     try:
+        for chunk in _param_chunks(paths):
+            placeholders = ",".join("?" * len(chunk))
+            if conn.execute(
+                f"SELECT 1 {_CCR_FROM} WHERE f.path IN ({placeholders}) "
+                "AND r.source != 'claude' LIMIT 1", chunk,
+            ).fetchone():
+                raise ValueError("Codex records cannot be archived before provider-aware archive support")
         conn.executemany(
             f"INSERT INTO ccreport_archive ({_CCR_ARCHIVE_SELECT}) "  # noqa: S608
             f"VALUES ({_CCR_ARCHIVE_PLACEHOLDERS})",

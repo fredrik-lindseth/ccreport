@@ -1,4 +1,4 @@
-# Calculation Reference — Claude Code Usage & Cost Pipeline
+# Calculation Reference — Claude Code and Codex Usage & Cost Pipeline
 
 ## Table of Contents
 
@@ -12,6 +12,7 @@
 8. [Display & Formatting](#8-display--formatting)
 9. [Account Attribution](#9-account-attribution)
 10. [Request Speed (speed.py)](#10-request-speed)
+11. [Codex Usage](#11-codex-usage)
 
 ---
 
@@ -55,7 +56,9 @@ most recent entry whose `effective` date is <= the message timestamp.
 
 1. Check `MODEL_ALIASES` dict (e.g. `"claude-opus-4-5"` -> `"claude-opus-4-5-20251101"`)
 2. Exact match against period's models dict
-3. Substring match: if `key in resolved` or `resolved in key`
+3. For Claude, substring match: if `key in resolved` or `resolved in key`.
+   OpenAI IDs require an exact name or an explicit alias;
+   an unknown model must not borrow another model's price (see §11).
 
 ### Current Prices
 
@@ -410,7 +413,7 @@ new `CREATE TABLE` there gets a row here.
 | `session_costs` | Per-session JSONL cost cache | pricing.py |
 | `ccreport_files` | Per-file mtime/size tracking for ccreport | scan.py |
 | `ccreport_records` | Parsed assistant message records | scan.py |
-| `ccreport_rollups` | Per-day aggregates of the post-dedup record stream, keyed `(day, oslo_date, sid, project, model, account)`; what a bare `ccreport` serves for days past `ROLLUP_WINDOW_DAYS`. Valid only against `meta.ccreport_rollup_fp`, and derivable from `ccreport_records` | ccreport.py |
+| `ccreport_rollups` | Per-day aggregates of the post-dedup record stream, keyed `(day, oslo_date, sid, project, model, account, source, account_uuid, thread_id)`; what a bare `ccreport` serves for days past `ROLLUP_WINDOW_DAYS`. Valid only against `meta.ccreport_rollup_fp`, and derivable from `ccreport_records` | ccreport.py |
 | `ccreport_orphan_costs` | All-time cost of records whose JSONL is gone, pre-summed per `(dir_prefix, project, cwd, repo)`. Orphans are most of `ccreport_records` and none can ever change, but `all_time` has no window to bound the walk. Override rules are resolved at read time, so a `ccreport merge` re-groups with no rebuild. Valid only against `meta.ccreport_orphan_fp` | pricing.py |
 | `project_overrides` | Manual project-grouping rules (`name` / `remote` / `cwd_prefix` → target), applied by every reader | ccreport.py (write), project_identity.py (read) |
 | `project_scopes` | The resolved `(name, prefixes)` scope per cwd (§5.6). No fingerprint of its own — every writer of its two inputs clears it in the same transaction | pricing.py |
@@ -531,6 +534,8 @@ else:
 - **Records**: stored as individual rows in `ccreport_records`, keyed to their file by an
   integer `file_id` into `ccreport_files` (indexed on `file_id` and `ts`). Every reader
   joins that table back in to answer with the path
+  `source` distinguishes `claude` from `codex`; Codex also preserves the logged
+  `account_uuid`, `thread_id` and `reasoning_output_tokens` (§11).
 - **Orphan preservation**: when JSONL files are purged from disk (e.g. Claude Code auto-cleanup),
   their cached records are kept in SQLite. `load_all_records()` picks them out of the
   `bulk_load_ccreport_cache()` result — every cached file whose path was not seen on disk
@@ -557,6 +562,10 @@ else:
   writes nothing. Nothing rebuilds this table — it is the only copy of the days
   it covers, and `ccreport server push --full` stops being a way to rebuild a
   server from this machine once it has rows
+  Codex files are held back at call grain: their original usage and attribution
+  must remain available while model pricing and historical account coverage
+  are incomplete. Codex's `archived_sessions` directory is still an input log
+  directory and is unrelated to this database archive.
 - **Writes are batched**: freshly parsed files accumulate and flush through
   `save_ccreport_files()` every `_SAVE_BATCH` files, one write transaction per batch
 - **Cost computation reads it too**: `compute_costs` sums a live file from
@@ -1111,6 +1120,8 @@ class AggBucket:
 | project | project name (last path segment) | by cost descending |
 | session | session_id | by cost descending |
 | account | account label (§9) | by cost descending |
+| model | logged model ID | by known cost descending |
+| tool | originating tool (`claude` or `codex`) | by known cost descending |
 
 **Token formatting:**
 ```
@@ -1765,3 +1776,136 @@ two machines pushed is timed once, on the copy that won the dedup. Turns are
 deduped on uuid, first rowid wins. Every call is counted, timed or not, so a row
 can say what share of its calls was measured. Archived sums have no server-side
 counterpart, so every figure on the page is a median.
+
+---
+
+## 11. Codex Usage
+
+`codex_scan.py` supplies the Codex records that `scan.py` writes through the
+existing file cache. Both `$CODEX_HOME/sessions/**/*.jsonl` and
+`$CODEX_HOME/archived_sessions/**/*.jsonl` are inputs, with `~/.codex` as the
+default home. There is no credential read or API request. Files are streamed,
+and only metadata, turn contexts and usage events are decoded for this reader.
+Changed files are fully reparsed using the same `(mtime_ns, size)` contract as
+Claude files; unchanged files reuse the cache. A read error propagates so a
+partial parse cannot overwrite a complete cache entry. An incomplete final
+JSON line is picked up after the next append.
+
+### 11.1 Calls, models and tokens
+
+One `token_usage_record.usage` is one call. `response_id` is its dedup key, and
+the reader keeps the originating tool in the dedup identity so another tool's
+IDs cannot collide. The `thread_token_usage`, `turn_token_usage` and
+`event_msg/token_count` counters are not additional calls. In particular,
+repeated cumulative readings and a counter reset do not affect this parser.
+Legacy files with only `token_count` are skipped with an explicit diagnostic;
+this release does not infer per-call history from cumulative deltas.
+
+The first `session_meta` identifies a file's own thread. Forked files can also
+contain their parent's metadata and context: metadata is keyed by thread ID,
+inherited calls are left to the parent's log, and
+`subagent_history_start_ordinal` excludes inherited contexts from the child's
+fallback model. `turn_context.model` is matched by `turn_id`; an unmatched turn
+uses the preceding eligible own-thread model, or `unknown`. A diagnostic
+identifies that uncertainty. A fork without a history boundary does not use a
+preceding model as fallback. User, subagent and guardian-review calls all count.
+
+`session_id` is the root conversation used by the session report; `thread_id`
+is retained separately. Models keep their logged IDs, including
+`codex-auto-review`, rather than borrowing the parent's selected model.
+
+For supported records, the normalisation is:
+
+```text
+input        = input_tokens - cached_input_tokens
+cache_read   = cached_input_tokens
+output       = output_tokens
+total        = input + cache_read + output
+reasoning    = reasoning_output_tokens  # already included in output
+```
+
+Counts must be nonnegative integers; cache reads cannot exceed input, reasoning
+cannot exceed output, and a provided total must equal input plus output.
+Nonzero `cache_write_input_tokens` is explicitly unsupported until its rollout
+accounting is verified. Such records are skipped with a diagnostic, rather
+than guessed into a token category or silently given a free write price.
+
+### 11.2 Projects, accounts and durable storage
+
+Git remote, cwd fallback and local project overrides use the same identity
+rules as Claude records. The account comes from the owning thread's logged
+`creator_account_id`, preserved as `account_uuid`. It is displayed as the ID
+plus `(ChatGPT)` when known, or `Codex – unknown account`. A current login is
+not historical evidence: neither Claude's account timeline nor Codex's current
+credentials supplies a missing account. `ccreport adopt` continues to claim
+Claude history only.
+
+Records preserve `source`, `account_uuid`, `thread_id` and
+`reasoning_output_tokens`. Rollups retain those fields and include source,
+account ID and thread ID in their grouping key. Parser and pricing changes
+invalidate the appropriate cached views through the existing fingerprints.
+Purged Codex logs retain their individual cached calls; `ccreport archive`
+holds them back so later price or attribution corrections still have the
+original per-call data. A file in Codex's `archived_sessions` directory remains
+a discoverable source log, not a ccreport database archive row.
+
+### 11.3 API value and report coverage
+
+`ccreport model` aggregates by logged model, `ccreport tool` by originating
+tool, and `--tool claude|codex` filters the normal reports. The ordinary report
+includes a model table when Codex records are present and a tool table when
+both tools are present. `--models` remains the daily model-breakdown option.
+JSON includes source, account ID, thread ID and the reasoning count without
+adding reasoning to the total a second time.
+
+OpenAI rates in `pricing.PRICING_HISTORY` are **Standard API value**, not actual
+subscription spend or quota usage. For a price set with `request_threshold`,
+the full request's input (`input + cache_create + cache_read`) selects the
+normal or long-context rates. Above 272,000 input tokens, the long rates apply
+to the whole request, including its output. This differs from the existing
+Claude per-category 200K calculation; that rule is unchanged. Service-tier
+premiums and GPT-5.5 session-wide repricing are not inferred from these logs.
+
+Only verified dated prices are used. A call before its model's earliest
+verified pricing period remains unpriced; no later rate is silently projected
+backwards. `codex-auto-review` remains unpriced because its underlying model
+has not been established. Its calls and tokens still appear in reports. Rows
+containing only unpriced calls say `unpriced`; a mixed row marks its known-cost
+subtotal with `*`, and a report note gives the number of unpriced calls. JSON
+uses `cost_usd: null` for an unpriced Codex call. Cached input is discounted
+API value, not evidence of free subscription use.
+
+Rate and product references, verified 2026-10-15:
+
+- [OpenAI API pricing](https://developers.openai.com/api/docs/pricing)
+- [GPT-6 Astra pricing and context rules](https://developers.openai.com/api/docs/models/gpt-6-astra)
+- [GPT-6.1 Sol pricing and context rules](https://developers.openai.com/api/docs/models/gpt-6.1-sol)
+- [Codex credit pricing and subscription caveats](https://learn.chatgpt.com/docs/pricing)
+- [Codex log locations](https://learn.chatgpt.com/docs/reference/troubleshooting)
+
+### 11.4 Server and Claude quota isolation
+
+The push protocol carries source, thread ID and reasoning alongside the
+account ID and token counts. Codex calls with no logged account remain local;
+an unknown model price causes the server to reject the whole offered file,
+without advancing that file's watermark. Normal redaction policies still
+apply. Server reports can filter by tool and aggregate by model or tool.
+
+Local `-A` pull remains scoped to the current Claude account and Claude data.
+It does not fetch or merge other machines' Codex calls. Use server reports to
+view Codex across machines. A local model report also cannot derive remote
+model usage from the pulled day totals, which have no model dimension.
+
+The status line, `ccu`, quota guard and both CLI/server `limits` remain Claude
+readers. Their local, orphan, archive and remote-cost paths exclude Codex;
+adding Codex reporting does not change a Claude quota window's spend.
+
+### 11.5 Synthetic fixtures
+
+`tools/make_synthetic_logs.py --codex <out_dir>` adds a deterministic Codex
+home under `<out_dir>/codex` alongside the existing Claude fixture tree. The
+Codex fixture has a model change, an inherited subagent history, a guardian in
+`archived_sessions`, missing account/context metadata, and repeated cumulative
+events. Tests compare each parsed call with independent expected counts and
+verify a mixed corpus through cold parsing and warm cache reloads. Existing
+Claude fixtures retain their original format and defaults.

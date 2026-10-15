@@ -1,4 +1,4 @@
-"""Shared Claude model pricing data, cost calculation, and cost aggregation.
+"""Shared model pricing data, cost calculation, and cost aggregation.
 
 Single source of truth for pricing tables, model aliases, cost formulas,
 and cost aggregation. ccreport.py, statusline.py, usage_api.py, ccu.py and
@@ -117,7 +117,13 @@ def _tz_from_env(tz_env: str | None) -> ZoneInfo:
         return ZoneInfo("UTC")
 
 # Source: https://github.com/BerriAI/litellm model_prices_and_context_window.json
-LAST_CHECKED = "2026-10-08"
+LAST_CHECKED = "2026-10-15"
+
+# OpenAI Standard API valuation, not Codex subscription charges. Verified against
+# LiteLLM and https://developers.openai.com/api/docs/pricing plus model pages
+# and /api/docs/changelog on LAST_CHECKED. Earlier Terra/Sol cached rates have
+# not been verified: leave those periods unpriced rather than backdating today's
+# rates. GPT-5.5 has no explicit cache-write price in the verified sources.
 
 PRICING_HISTORY: list[dict[str, Any]] = [
     {
@@ -193,6 +199,18 @@ PRICING_HISTORY: list[dict[str, Any]] = [
         },
     },
     {
+        "effective": "2026-04-23",
+        "models": {
+            "gpt-5.5": {
+                "input": 5e-06, "output": 30e-06,
+                "cache_create": 0e-06, "cache_read": 0.5e-06,
+                "long_prompt": 272_000,
+                "input_long": 10e-06, "output_long": 45e-06,
+                "cache_create_long": 0e-06, "cache_read_long": 1e-06,
+            },
+        },
+    },
+    {
         # Opus 4.8 first seen 2026-05-29, same pricing as 4.7.
         "effective": "2026-05-29",
         "models": {
@@ -244,15 +262,70 @@ PRICING_HISTORY: list[dict[str, Any]] = [
         },
     },
     {
+        "effective": "2026-07-30",
+        "models": {
+            "gpt-5.6-terra": {
+                "input": 2e-06, "output": 12e-06,
+                "cache_create": 2.5e-06, "cache_read": 0.2e-06,
+                "long_prompt": 272_000,
+                "input_long": 4e-06, "output_long": 18e-06,
+                "cache_create_long": 5e-06, "cache_read_long": 0.4e-06,
+            },
+        },
+    },
+    {
+        "effective": "2026-08-21",
+        "models": {
+            "gpt-5.6-sol": {
+                "input": 4e-06, "output": 20e-06,
+                "cache_create": 5e-06, "cache_read": 0.4e-06,
+                "long_prompt": 272_000,
+                "input_long": 8e-06, "output_long": 30e-06,
+                "cache_create_long": 10e-06, "cache_read_long": 0.8e-06,
+            },
+        },
+    },
+    {
+        "effective": "2026-09-03",
+        "models": {
+            "gpt-6-astra": {
+                "input": 10e-06, "output": 50e-06,
+                "cache_create": 12.5e-06, "cache_read": 1e-06,
+                "long_prompt": 272_000,
+                "input_long": 20e-06, "output_long": 75e-06,
+                "cache_create_long": 25e-06, "cache_read_long": 2e-06,
+            },
+        },
+    },
+    {
         # Opus 5.5 first seen 2026-09-22 16:46 UTC, $4/$20 per MTok, cache
         # write $5 and cache read $0.20. Opus 5 keeps its own period's price:
         # claude-opus-5 is a substring of this key, which is why
         # _pricing_in_effect takes an exact key before any substring match.
         "effective": "2026-09-22",
         "models": {
+            "gpt-6-sol": {
+                "input": 2e-06, "output": 10e-06,
+                "cache_create": 2.5e-06, "cache_read": 0.2e-06,
+                "long_prompt": 272_000,
+                "input_long": 4e-06, "output_long": 15e-06,
+                "cache_create_long": 5e-06, "cache_read_long": 0.4e-06,
+            },
             "claude-opus-5-5": {
                 "input": 4e-06, "output": 20e-06,
                 "cache_create": 5e-06, "cache_read": 0.2e-06,
+            },
+        },
+    },
+    {
+        "effective": "2026-09-29",
+        "models": {
+            "gpt-6.1-sol": {
+                "input": 2e-06, "output": 10e-06,
+                "cache_create": 2.5e-06, "cache_read": 0.1e-06,
+                "long_prompt": 272_000,
+                "input_long": 4e-06, "output_long": 15e-06,
+                "cache_create_long": 5e-06, "cache_read_long": 0.2e-06,
             },
         },
     },
@@ -274,6 +347,8 @@ PRICING_HISTORY: list[dict[str, Any]] = [
 ]
 
 MODEL_ALIASES: dict[str, str] = {
+    "gpt-5.6": "gpt-5.6-sol",
+    "gpt-5.5-2026-04-23": "gpt-5.5",
     "claude-opus-4-5": "claude-opus-4-5-20251101",
     "claude-sonnet-4": "claude-sonnet-4-20250514",
     "claude-sonnet-4-5": "claude-sonnet-4-5-20250929",
@@ -390,12 +465,30 @@ def _pricing_in_effect(resolved: str, periods: int) -> Mapping[str, float] | Non
         models = PRICING_HISTORY[i]["models"]
         if resolved in models:
             return models[resolved]
+    # OpenAI IDs require an explicit alias/exact match. A substring would
+    # silently price gpt-5.6-terra as Sol or a future variant as an older model.
+    if not resolved.startswith("claude-"):
+        return None
     for i in reversed(in_effect):
         models = PRICING_HISTORY[i]["models"]
         for key, prices in models.items():
             if key in resolved or resolved in key:
                 return prices
     return None
+
+
+def has_pricing(model: str, ts: datetime | None = None, *, source: str | None = None) -> bool:
+    """Whether a model has a known API valuation at *ts* (zero included).
+
+    Unknown Codex models such as codex-auto-review must remain visible as
+    unpriced; a zero returned by calc_cost is not evidence of a free model.
+    """
+    # Claude's local-provider convention does not establish whether an
+    # arbitrary Codex provider/model is free. Preserve its token usage as
+    # unpriced until that provider's accounting is known.
+    if source == "codex" and ":" in model:
+        return False
+    return bool(model and model.startswith("<")) or find_pricing(model, ts) is not None
 
 
 PLAN_PRICES: list[dict[str, Any]] = [
@@ -604,24 +697,26 @@ def calc_cost(
 ) -> float:
     """Calculate total cost for a set of token counts using model-specific pricing.
 
-    A model with `long_prompt` is tiered on the whole prompt (LONG_PROMPT_KEY);
-    any other model's 200K tier is applied per token type independently: each
-    type's count is checked against the threshold separately.
+    Models with long_prompt use whole-prompt tiering, including Haiku 5.5.
+    Counts are disjoint: input excludes cache reads/writes, output already
+    includes reasoning. Claude's 200K tier remains per token type. OpenAI's
+    >272K input tier prices the whole request, including cached input, at the
+    long-context rates. This is Standard API value, not a subscription bill;
+    service-tier premiums and GPT-5.5 session-wide repricing are not inferred.
     """
     prices = find_pricing(model, ts)
     if not prices:
         if model and not model.startswith("<"):
             print(f"Warning: no pricing found for model '{model}'", file=sys.stderr)
         return 0.0
-    long_prompt = prices.get(LONG_PROMPT_KEY)
-    if long_prompt is not None:
-        suffix = "_long" if input_tokens + cache_create_tokens + cache_read_tokens > long_prompt else ""
-        return (
-            input_tokens * prices[f"input{suffix}"]
-            + output_tokens * prices[f"output{suffix}"]
-            + cache_create_tokens * prices[f"cache_create{suffix}"]
-            + cache_read_tokens * prices[f"cache_read{suffix}"]
-        )
+    threshold = prices.get("long_prompt")
+    if threshold is not None:
+        long = input_tokens + cache_create_tokens + cache_read_tokens > threshold
+        suffix = "_long" if long else ""
+        return sum(count * prices.get(kind + suffix, 0.0) for count, kind in (
+            (input_tokens, "input"), (output_tokens, "output"),
+            (cache_create_tokens, "cache_create"), (cache_read_tokens, "cache_read"),
+        ))
     return (
         tiered_cost(input_tokens, prices.get("input", 0.0), prices.get("input_200k"))
         + tiered_cost(output_tokens, prices.get("output", 0.0), prices.get("output_200k"))
@@ -923,7 +1018,7 @@ def _file_identities() -> list[tuple[str, str | None, str | None, str]]:
     """cache_db.load_ccreport_file_identities, imported at call time."""
     from ccreport.cache_db import load_ccreport_file_identities
 
-    return load_ccreport_file_identities()
+    return load_ccreport_file_identities(source="claude")
 
 
 def _load_cached_scope(cwd: str) -> tuple[str, list[str]] | None:
@@ -1375,7 +1470,7 @@ def _purged_session_usage(session_id: str, cwd: str) -> SessionUsage:
     try:
         from ccreport.cache_db import load_ccreport_records_for_session
 
-        ccr_records_by_file = load_ccreport_records_for_session(session_id)
+        ccr_records_by_file = load_ccreport_records_for_session(session_id, source="claude")
         project_prefixes = project_path_prefixes(cwd, _get_projects_dirs())
         total = 0.0
         families: set[str] = set()
@@ -1569,7 +1664,7 @@ def _build_orphan_alltime(
 
     buckets: dict[tuple[str, str, str, str], float] = {}
     seen_keys: set[str] = set()
-    for fp, recs in load_ccreport_records_for_paths(orphan_paths).items():
+    for fp, recs in load_ccreport_records_for_paths(orphan_paths, source="claude").items():
         prefix = _project_dir_prefix(fp, projects_dirs) or ""
         for rec in recs:
             if record_is_duplicate(rec, seen_keys):
@@ -2057,8 +2152,8 @@ def compute_costs(
 
     # Both halves of the ccreport cache, each read at its own grain: the
     # fingerprints for every cached file, the records for one window's worth.
-    ccr_file_meta = load_ccreport_file_meta()
-    ccr_records_by_file = load_ccreport_records_since(record_cutoff)
+    ccr_file_meta = load_ccreport_file_meta(source="claude")
+    ccr_records_by_file = load_ccreport_records_since(record_cutoff, source="claude")
 
     # Every JSONL still on disk, across all projects: this function owes a
     # global total as well as the project's, so its walk is the whole corpus.

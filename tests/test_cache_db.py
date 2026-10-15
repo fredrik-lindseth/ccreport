@@ -165,6 +165,7 @@ _ROLLUP_ROW = (
     40,
     1.5,
     7,
+    "claude", "", "", 0,
 )
 
 
@@ -987,7 +988,10 @@ class TestCcreportRows:
         stored = db.execute(
             f"SELECT {', '.join(_CCR_COLS)} FROM ccreport_records"
         ).fetchone()
-        assert all(v is not None for v in stored)
+        values = dict(zip(_CCR_COLS, stored, strict=True))
+        assert values.pop("account_uuid") is None
+        assert values.pop("thread_id") is None
+        assert all(v is not None for v in values.values())
 
     def test_the_record_dict_matches_the_column_tuple(self, db):
         """_group_by_file indexes the row by position; this is what names it.
@@ -3332,3 +3336,60 @@ class TestFileAllTimeUnder:
         # moved-on keys, takes the row with it.
         assert load_cost_cache("w2", "m2") == {}
         assert db.execute("SELECT COUNT(*) FROM file_costs").fetchone() == (0,)
+
+
+class TestCodexCache:
+    def test_codex_record_roundtrip_and_claude_loader_isolation(self, db):
+        from ccreport import scan
+        from ccreport.aggregate import TokenCounts, UsageRecord
+
+        record = UsageRecord(
+            message_id="response-1", model="gpt-5", tokens=TokenCounts(10, 8, 0, 5),
+            timestamp=datetime(2026, 6, 15, tzinfo=UTC), session_id="thread-1", project="proj",
+            source="codex", account_uuid="raw-account", thread_id="thread-1",
+            reasoning_output_tokens=6,
+        )
+        compact = scan._serialize_records([record])
+        save_ccreport_file("/codex/rollout.jsonl", 1, 2, compact)
+        claude = {**TestCcreportRows.RECORD, "sid": "thread-1"}
+        save_ccreport_file("/claude/a.jsonl", 1, 2, [claude])
+        _, records = bulk_load_ccreport_cache()
+        restored, = scan._deserialize_records(records["/codex/rollout.jsonl"])
+        assert restored == record
+        assert restored.reasoning_output_tokens <= restored.tokens.output
+        for selected in (
+            cache_db.load_ccreport_records_since(0, source="claude"),
+            cache_db.load_ccreport_records_for_session("thread-1", source="claude"),
+            cache_db.load_ccreport_records_for_paths(records, source="claude"),
+            cache_db.load_ccreport_records_under("/", source="claude"),
+            bulk_load_ccreport_cache(source="claude")[1],
+        ):
+            assert selected == {"/claude/a.jsonl": [claude]}
+        assert set(cache_db.load_ccreport_file_meta(source="claude")) == {"/claude/a.jsonl"}
+        assert {r[0] for r in cache_db.load_ccreport_file_identities(source="claude")} == {"/claude/a.jsonl"}
+
+    def test_archive_refuses_codex_without_deleting_records(self, db):
+        record = {**TestCcreportRows.RECORD, "source": "codex", "account_uuid": "account",
+                  "thread_id": "thread", "reasoning_output_tokens": 1}
+        save_ccreport_file("/codex/a.jsonl", 1, 2, [record])
+        with pytest.raises(ValueError, match="cannot be archived"):
+            cache_db.save_ccreport_archive([], {"/codex/a.jsonl"})
+        assert bulk_load_ccreport_cache()[1]["/codex/a.jsonl"] == [record]
+
+    def test_v16_records_survive_provider_migration(self, db):
+        save_ccreport_file("/claude/a.jsonl", 1, 2, [TestCcreportRows.RECORD])
+        for name in ("source", "account_uuid", "thread_id", "reasoning_output_tokens"):
+            db.execute(f"ALTER TABLE ccreport_records DROP COLUMN {name}")
+        cache_db._migrate_codex_records(db)
+        row = db.execute(
+            "SELECT mid, source, account_uuid, thread_id, reasoning_output_tokens, req_start, req_end "
+            "FROM ccreport_records"
+        ).fetchone()
+        assert row == ("m1", "claude", None, None, 0, 0.5, 1.5)
+        assert cache_db.load_ccreport_rollups() == []
+
+    def test_rollup_keeps_provider_and_account_identities(self, db):
+        codex = (*_ROLLUP_ROW[:14], "codex", "account-a", "thread-1", 3)
+        other = (*_ROLLUP_ROW[:14], "codex", "account-b", "thread-1", 4)
+        cache_db.save_ccreport_rollups([_ROLLUP_ROW, codex, other], "codex")
+        assert set(cache_db.load_ccreport_rollups()) == {_ROLLUP_ROW, codex, other}

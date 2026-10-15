@@ -1,10 +1,12 @@
 # ccreport
 
-Token usage and cost reporting for Claude Code, a quota dashboard, and the
-status line: three commands over one cache.
+Token usage and cost reporting for Claude Code and Codex, plus a Claude Code
+quota dashboard and status line: three commands over one cache.
 
 `ccreport` and the status line work off the JSONL session logs Claude Code
 already writes under `~/.claude/projects/` (or `~/.config/claude/projects/`).
+The reports also read Codex rollouts under `$CODEX_HOME/sessions/` and
+`$CODEX_HOME/archived_sessions/`; `CODEX_HOME` defaults to `~/.codex`.
 
 ## Install
 
@@ -204,6 +206,10 @@ ccreport daily --since 20260201 --breakdown
 ccreport monthly
 ccreport project --limit 10
 ccreport session --limit 10
+ccreport model --tool codex                 # model, tokens and API value
+ccreport tool                              # Claude Code and Codex totals
+ccreport daily --tool claude                # select one tool
+ccreport --tool codex --json                # local calls, including reasoning metadata
 ccreport limits -w session                  # rate-limit window history
 ```
 
@@ -217,6 +223,36 @@ ccreport overrides
 ccreport merge company company-platform  # company's records report as company-platform
 ccreport unmerge company
 ```
+
+Codex calls appear in the same reports as Claude Code. The reader counts each
+`token_usage_record` once by response ID, including subagents and automatic
+reviews; the cumulative `token_count` events alongside them are not additional
+calls. Cached input is shown separately from ordinary input, and reasoning is
+already part of output. JSON preserves the reasoning count, originating tool,
+thread ID and logged account ID.
+
+Codex costs are **API Standard value estimates**, not an account bill or a
+subscription quota calculation. A `*` marks a partial cost total when some calls
+have no verified price; wholly unpriced rows say `unpriced`, and JSON uses
+`null` for those calls. `codex-auto-review`
+keeps its logged model name and remains unpriced because its underlying model
+has not been established. Usage before a model's verified pricing period is
+also unpriced. Cache hits have a discounted API value, not a guarantee of free
+subscription usage. See the [Codex calculation notes](docs/calculation-reference.md#11-codex-usage).
+
+ChatGPT accounts come from the rollout's `creator_account_id`. Older calls
+without it appear as `Codex – unknown account`; current login credentials are
+not used to assign historical usage. Legacy rollouts with only `token_count`,
+and calls with nonzero cache-write counts whose accounting is not yet verified,
+are explicitly reported as unsupported. A missing turn context also produces
+a diagnostic when model attribution needs a fallback.
+
+`ccreport archive` retains Codex history as individual cached calls so future
+price and attribution corrections remain possible. Push/server reports can
+include Codex calls with known account and pricing, but Codex pull into local
+`-A` reports is not supported yet. Use the server's reports for combined Codex
+usage across machines. The status line, `ccu`, quota guard and `limits` continue
+to use Claude Code data only.
 
 ## ccu
 

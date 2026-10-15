@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from ccreport import pricing, project_identity, scan
+from ccreport import codex_scan, pricing, project_identity, scan
 
 REPO = Path(__file__).resolve().parent.parent
 TOOL = REPO / "tools" / "make_synthetic_logs.py"
@@ -138,6 +138,57 @@ class TestParse:
         assert all(r.cost() > 0 for r in recs)
 
 
+class TestCodexCorpus:
+    def test_each_modern_call_survives_without_counting_inherited_or_cumulative_usage(self, gen, tmp_path):
+        expected = gen.write_codex_corpus(tmp_path / "codex", seed=7)
+        with pytest.warns(RuntimeWarning, match="lack matching turn_context"):
+            got = {
+                record.message_id: record
+                for path in {item.path for item in expected}
+                for record in codex_scan.parse_rollout_file(path)
+            }
+        assert len(got) == len(expected) == 5
+        for exp in expected:
+            rec = got[exp.response_id]
+            assert rec.model == exp.model
+            assert rec.session_id == exp.session_id
+            assert rec.thread_id == exp.thread_id
+            assert rec.account_uuid == exp.account_uuid
+            assert rec.tokens.input + rec.tokens.cache_read == exp.input_tokens
+            assert rec.tokens.cache_read == exp.cached_input_tokens
+            assert rec.tokens.output == exp.output_tokens
+            assert rec.tokens.total == exp.input_tokens + exp.output_tokens
+            assert rec.reasoning_output_tokens == exp.reasoning_output_tokens
+            assert rec.project == "alpha"
+            assert rec.source == "codex"
+
+    def test_both_sources_survive_scan_and_cached_reload(self, gen, tmp_path, monkeypatch):
+        from ccreport import cache_db
+
+        claude = gen.write_corpus(tmp_path / "claude", projects=1, sessions=1, days=1)
+        codex = gen.write_codex_corpus(tmp_path / "codex")
+        monkeypatch.setattr(scan, "_PROJECT_ROOTS", (tmp_path / "claude/projects",))
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+        with pytest.warns(RuntimeWarning, match="lack matching turn_context"):
+            scan.refresh_cache()
+        raw = cache_db.load_ccreport_records_in_range(None, None)
+        cached = [rec for records in raw.values() for rec in scan._deserialize_records(records)]
+        assert sum(rec.source == "claude" for rec in cached) == len(claude)
+        assert sum(rec.source == "codex" for rec in cached) == len(codex)
+        assert sum(rec.tokens.total for rec in cached if rec.source == "codex") == sum(
+            exp.input_tokens + exp.output_tokens for exp in codex
+        )
+        before = raw
+        scan.refresh_cache()
+        assert cache_db.load_ccreport_records_in_range(None, None) == before
+
+    def test_seed_is_deterministic(self, gen, tmp_path):
+        first = gen.write_codex_corpus(tmp_path / "first", seed=8)
+        second = gen.write_codex_corpus(tmp_path / "second", seed=8)
+        assert [(r.response_id, r.thread_id, r.model) for r in first] == [
+            (r.response_id, r.thread_id, r.model) for r in second
+        ]
+
 class TestDiscovery:
     def test_discovery_finds_every_generated_session(self, corpus, tmp_path, monkeypatch):
         monkeypatch.setattr(scan, "_PROJECT_ROOTS", (tmp_path / "synth" / "projects",))
@@ -152,6 +203,18 @@ class TestDiscovery:
 
 
 class TestCommandLine:
+    def test_the_cli_can_add_codex_without_changing_the_claude_tree(self, tmp_path):
+        out = subprocess.run(
+            [sys.executable, str(TOOL), str(tmp_path / "cli"),
+             "--projects", "1", "--sessions", "1", "--days", "1", "--codex"],
+            capture_output=True, text=True, timeout=120, cwd=str(REPO),
+        )
+        assert out.returncode == 0, out.stderr
+        assert len(list((tmp_path / "cli/projects").rglob("*.jsonl"))) == 1
+        assert len(list((tmp_path / "cli/codex/sessions").rglob("*.jsonl"))) == 2
+        assert len(list((tmp_path / "cli/codex/archived_sessions").rglob("*.jsonl"))) == 1
+        assert "5 Codex calls" in out.stdout
+
     def test_the_cli_writes_the_tree(self, tmp_path):
         out = subprocess.run(
             [sys.executable, str(TOOL), str(tmp_path / "cli"),

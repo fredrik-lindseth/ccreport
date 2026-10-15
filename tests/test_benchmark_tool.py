@@ -52,10 +52,14 @@ class TestBenchmarkTarget:
         assert bench.STATUSLINE == REPO / "bin" / "statusline-command_x.sh"
 
     @pytest.mark.skipif(sys.platform != "darwin", reason="the wrapper is macOS-only")
-    def test_the_target_renders_when_run_as_the_benchmark_runs_it(self, bench):
+    def test_the_target_renders_when_run_as_the_benchmark_runs_it(self, bench, tmp_path):
+        # A subprocess cannot inherit conftest's patched cache_db.DB_PATH.
+        # Keep the wrapper off the developer's durable database and credentials.
+        env = {**os.environ, "HOME": str(tmp_path), "XDG_DATA_HOME": str(tmp_path / "data"),
+               "XDG_CONFIG_HOME": str(tmp_path / "config"), "TMPDIR": str(tmp_path)}
         out = subprocess.run(
             [str(bench.STATUSLINE), "-t"],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, text=True, timeout=60, env=env,
         )
         assert out.returncode == 0
         assert out.stdout.strip()

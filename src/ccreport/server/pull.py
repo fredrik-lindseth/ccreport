@@ -56,14 +56,14 @@ class MachineRemainder:
 
 
 _EXCLUDE = """
-    a.account_uuid = ? AND a.machine_id != ?
+    a.source = 'claude' AND a.account_uuid = ? AND a.machine_id != ?
     AND (a.dk IS NULL OR a.dk = '' OR a.dk NOT IN (
         SELECT dk FROM server_records
-         WHERE account_uuid = ? AND machine_id = ? AND dk IS NOT NULL AND dk != ''
+         WHERE source = 'claude' AND account_uuid = ? AND machine_id = ? AND dk IS NOT NULL AND dk != ''
     ))
     AND (a.dk IS NULL OR a.dk = '' OR a.id IN (
         SELECT MIN(id) FROM server_records
-         WHERE account_uuid = ? AND machine_id != ?
+         WHERE source = 'claude' AND account_uuid = ? AND machine_id != ?
          GROUP BY account_uuid, dk
     ))
 """

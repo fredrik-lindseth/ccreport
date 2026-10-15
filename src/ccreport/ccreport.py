@@ -212,7 +212,9 @@ def _keep(
     """
     if override:
         rec.project = override(rec.repo, rec.cwd, rec.project)
-    if accounts is not None:
+    if rec.source == "codex":
+        rec.account = f"{rec.account_uuid} (ChatGPT)" if rec.account_uuid else "Codex – unknown account"
+    elif accounts is not None:
         rec.account = accounts.label_at(rec.timestamp)
     if since and rec.timestamp < since:
         return False
@@ -229,6 +231,7 @@ def _keep(
          rec.tokens.cache_create, rec.tokens.cache_read),
     )
     if key is not None:
+        key = f"codex:{key}" if rec.source == "codex" else key
         if key in seen_keys:
             return False
         seen_keys.add(key)
@@ -270,6 +273,7 @@ def load_all_records(
     account_filter: str | None = None,
     *,
     use_rollups: bool = False,
+    tool_filter: str | None = None,
 ) -> list[UsageRecord]:
     """Load and deduplicate all usage records.
 
@@ -296,8 +300,10 @@ def load_all_records(
                 "rollups aggregate away what a filter selects on; "
                 "load the full record stream instead"
             )
-        return _load_with_rollups(files, live_paths)
-    return _load_full(files, live_paths, since, until, project_filter, account_filter)
+        records = _load_with_rollups(files, live_paths)
+    else:
+        records = _load_full(files, live_paths, since, until, project_filter, account_filter)
+    return [r for r in records if r.source == tool_filter] if tool_filter else records
 
 
 def _load_full(
@@ -473,12 +479,13 @@ def _build_rollups(
             rec.day_key(),
             rec.fx_date().isoformat(),
             rec.session_id, rec.project, rec.model, rec.account,
+            rec.source, rec.account_uuid or "", rec.thread_id or "",
         )
         t = rec.tokens
         row = rows.get(key)
         if row is None:
             rows[key] = [ts, ts, t.input, t.output, t.cache_create, t.cache_read,
-                         rec.cost(), rec.count]
+                         rec.cost(), rec.count, rec.reasoning_output_tokens]
             continue
         row[0] = min(row[0], ts)
         row[1] = max(row[1], ts)
@@ -488,7 +495,10 @@ def _build_rollups(
         row[5] += t.cache_read
         row[6] += rec.cost()
         row[7] += rec.count
-    save_ccreport_rollups([(*key, *row) for key, row in rows.items()], fingerprint)
+        row[8] += rec.reasoning_output_tokens
+    save_ccreport_rollups([
+        (*key[:6], *row[:8], *key[6:], row[8]) for key, row in rows.items()
+    ], fingerprint)
 
 
 def _rollup_records(rows: list[tuple]) -> list[UsageRecord]:
@@ -505,7 +515,8 @@ def _rollup_records(rows: list[tuple]) -> list[UsageRecord]:
     """
     pairs: list[tuple[float, UsageRecord]] = []
     for (_day, oslo_date, sid, project, model, account,
-         min_ts, max_ts, tin, tout, tcc, tcr, cost, n) in rows:
+         min_ts, max_ts, tin, tout, tcc, tcr, cost, n,
+         source, account_uuid, thread_id, reasoning_output_tokens) in rows:
         pairs.append((min_ts, UsageRecord(
             message_id="",
             model=model,
@@ -521,6 +532,10 @@ def _rollup_records(rows: list[tuple]) -> list[UsageRecord]:
             account=account,
             count=n,
             oslo_date=date.fromisoformat(oslo_date),
+            source=source,
+            account_uuid=account_uuid or None,
+            thread_id=thread_id or None,
+            reasoning_output_tokens=reasoning_output_tokens,
         )))
     pairs.sort(key=lambda pair: pair[0])
     return [rec for _min_ts, rec in pairs]
@@ -867,7 +882,13 @@ def _token_row(
     b: "AggBucket", total_cost: float = 0.0, *,
     compact: bool = False, narrow: bool = False, nok: NokCtx,
 ) -> list:
-    cost_text = Text(fmt_cost(b.cost), style=cost_style(b.cost))
+    cost_label = fmt_cost(b.cost)
+    if b.unpriced_count:
+        cost_label = "unpriced" if b.unpriced_count == b.count else f"{cost_label}*"
+    cost_text = Text(
+        cost_label,
+        style=cost_style(b.cost),
+    )
     if narrow:
         cells = [cost_text]
         if nok.enabled:
@@ -1133,6 +1154,20 @@ def report_session(records: list[UsageRecord], limit: int | None = 20, *, nok: N
     render_session(aggregate.session_rows(records, nok, limit=limit), limit, nok=nok)
 
 
+def render_usage_split(report: ReportRows, title: str, label: str, *, nok: NokCtx) -> None:
+    """Draw a model or tool split with the full cache token columns."""
+    narrow = _is_narrow()
+    table = _make_report_table(title, label, narrow=narrow, nok=nok)
+    # The row already names the model/tool; repeating models adds little here.
+    if not narrow:
+        table.columns.pop()
+    for row in report.rows:
+        table.add_row(row.key, *_token_row(row.agg, report.total.cost, narrow=narrow, nok=nok))
+    table.add_section()
+    table.add_row("TOTAL", *_token_row(report.total, narrow=narrow, nok=nok), style="bold")
+    _print_report(table)
+
+
 def render_session(report: ReportRows, limit: int | None = 20, *, nok: NokCtx) -> None:
     """Draw the session table. *limit* only decides what the title claims."""
     narrow = _is_narrow()
@@ -1252,6 +1287,10 @@ def _json_entry(rec: UsageRecord, nok: NokCtx) -> dict[str, Any]:
         "session_id": rec.session_id,
         "project": rec.project,
         "account": rec.account,
+        "source": rec.source,
+        "account_uuid": rec.account_uuid,
+        "thread_id": rec.thread_id,
+        "reasoning_output_tokens": rec.reasoning_output_tokens,
         "input_tokens": rec.tokens.input,
         "output_tokens": rec.tokens.output,
         "cache_creation_tokens": rec.tokens.cache_create,
@@ -1259,6 +1298,9 @@ def _json_entry(rec: UsageRecord, nok: NokCtx) -> dict[str, Any]:
         "total_tokens": rec.tokens.total,
         "cost_usd": round(cost, 6),
     }
+    if rec.source == "codex" and not pricing.has_pricing(rec.model, rec.timestamp, source=rec.source):
+        entry["cost_usd"] = None
+        return entry
     if nok.enabled:
         amount, estimated = record_cost_nok(rec, cost, nok)
         if amount is not None:
@@ -1290,19 +1332,23 @@ def report_json(records: list[UsageRecord], *, nok: NokCtx) -> None:
 _REMOTE_KINDS = {
     "daily": "day", "monthly": "month",
     "project": "project", "session": "session", "account": "account",
+    "model": "model", "tool": "tool",
 }
 """Subcommand name → the report kind the server answers under."""
 
 
 def _remote_filters(args) -> dict:
     """The query a merged report is asked with, from the flags already parsed."""
-    return {
+    filters = {
         "since": getattr(args, "since", None),
         "until": getattr(args, "until", None),
         "project": getattr(args, "project", None),
         "account": getattr(args, "account", None),
         "machine": getattr(args, "machine", None),
     }
+    if getattr(args, "tool", None):
+        filters["tool"] = args.tool
+    return filters
 
 
 def _render_remote_report(payload: dict, kind: str, limit: int | None) -> None:
@@ -1322,6 +1368,8 @@ def _render_remote_report(payload: dict, kind: str, limit: int | None) -> None:
         render_project(report, limit, nok=nok)
     elif kind == "session":
         render_session(report, limit, nok=nok)
+    elif kind in ("model", "tool"):
+        render_usage_split(report, kind.title() + "s", kind.title(), nok=nok)
     else:
         render_account(report, nok=nok)
 
@@ -1781,8 +1829,9 @@ def cmd_push(args) -> None:
             # record no account_events entry covers used to travel under a
             # placeholder account and turn up on the server as a third person.
             console.print(
-                f"  {result.unattributed} records older than this machine's account log "
-                f"were left here. Run [bold]ccreport adopt[/bold] to claim them.",
+                f"  {result.unattributed} records without a known account were left here. "
+                "Use [bold]ccreport adopt[/bold] for older Claude history; "
+                "Codex needs an account ID in its log.",
             )
         for path, detail in result.rejected:
             failed = True
@@ -2110,7 +2159,7 @@ def _pre_capture_records(
     if not captures:
         return []
     first = min(captures)
-    return [r for r in records if r.timestamp.timestamp() < first]
+    return [r for r in records if r.source == "claude" and r.timestamp.timestamp() < first]
 
 
 def cmd_adopt(args) -> None:
@@ -2371,7 +2420,9 @@ def _load_instance_spend(
         return {}
     since = _as_local(min(i.first_ts for i in instances))
     until = _as_local(max(i.peak_ts for i in instances))
-    index = SpendIndex(load_all_records(since=since, until=until))
+    index = SpendIndex([
+        r for r in load_all_records(since=since, until=until) if r.source == "claude"
+    ])
     extra = ExtraIndex(cache_db.load_extra_snapshots())
     return {i.key: _instance_spend(i, index, extra, now) for i in instances}
 
@@ -2744,6 +2795,9 @@ def _plan_archive(min_age_days: int) -> tuple[ArchivePlan, float]:
     for path, raw in records_by_file.items():
         if path in live_paths or path in already:
             continue
+        if any(r.get("source", "claude") == "codex" for r in raw):
+            held_back[path] = "Codex history retained at call grain"
+            continue
         kept = [rec for rec in _deserialize_records(raw) if _keep(rec, **filters)]
         stamps = [rec.timestamp.timestamp() for rec in kept]
         if stamps and max(stamps) >= cutoff_ts:
@@ -2802,7 +2856,7 @@ def _dedup_keys(records: list[UsageRecord]) -> set[str]:
              rec.tokens.cache_create, rec.tokens.cache_read),
         )
         if key is not None:
-            keys.add(key)
+            keys.add(f"codex:{key}" if rec.source == "codex" else key)
     return keys
 
 
@@ -3084,7 +3138,7 @@ def main() -> None:
     # from the environment wins.
     os.environ.setdefault("CLAUDE_CACHE_SNAPSHOT_DEFER", "1")
     parser = argparse.ArgumentParser(
-        description="Analyze Claude Code token usage and costs from local JSONL logs.",
+        description="Analyze Claude Code and Codex token usage and API value from local JSONL logs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
                "  ccreport daily --since 20260201\n"
@@ -3108,7 +3162,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", help="Report type")
 
     # Common args
-    for name in ["daily", "monthly", "project", "session", "account"]:
+    for name in ["daily", "monthly", "project", "session", "account", "model", "tool"]:
         p = sub.add_parser(name)
         p.add_argument("--all", "-A", action="store_true",
                        help="Merge this account's spend from every pushing machine")
@@ -3116,6 +3170,8 @@ def main() -> None:
         p.add_argument("--until", help="End date (YYYYMMDD or YYYY-MM-DD)")
         p.add_argument("--project", "-p", help="Filter by project name (substring match)")
         p.add_argument("--account", "-a", help="Filter by account email (substring match)")
+        p.add_argument("--tool", choices=("claude", "codex"), default=argparse.SUPPRESS,
+                       help="Filter by originating tool")
         p.add_argument("--json", "-j", action="store_true", help="Output as JSON")
         p.add_argument("--no-mva", action="store_true", help="Show NOK without 25%% MVA")
         # SUPPRESS, not None: a subparser argument with a default overwrites
@@ -3277,6 +3333,7 @@ def main() -> None:
     parser.add_argument("--until", help="End date (YYYYMMDD or YYYY-MM-DD)")
     parser.add_argument("--project", "-p", help="Filter by project name")
     parser.add_argument("--account", "-a", help="Filter by account email")
+    parser.add_argument("--tool", choices=("claude", "codex"), help="Filter by originating tool")
     parser.add_argument("--json", "-j", action="store_true", help="Output as JSON")
     parser.add_argument("--no-mva", action="store_true", help="Show NOK without 25%% MVA")
     parser.add_argument("--models", "-m", action="store_true",
@@ -3385,12 +3442,15 @@ def main() -> None:
         # aggregated away, and --json prints one entry per API call.
         use_rollups=not (since or until or project_filter or account_filter
                          or wants_json),
+        tool_filter=args.tool,
     )
 
     # Local rows alone, always. -A merges the pulled tables below; without it
     # they answer the note under each table instead. Either way `ccreport` opens
     # no socket: these are local rows a detached pull wrote.
     remote = _remote_records(since, until, project_filter, account_filter)
+    if args.tool == "codex":
+        remote = RemoteSpend([], set())
     merge_all = bool(getattr(args, "all", False))
     # `local` stays this machine's own throughout. The session report reads it
     # even under -A: a pulled row is one day of one machine and carries no
@@ -3416,6 +3476,16 @@ def main() -> None:
         return
 
     command = args.command
+    unpriced = sum(
+        r.count for r in records
+        if r.source == "codex" and not pricing.has_pricing(r.model, r.timestamp, source=r.source)
+    )
+    if unpriced:
+        console.print(
+            f"[yellow]* Cost totals are partial: {unpriced} calls have no verified price.[/yellow]"
+        )
+    if any(r.source == "codex" for r in records):
+        console.print("[dim]Codex costs are API Standard value estimates; cache is included in input.[/dim]")
 
     def _note() -> None:
         """The gap note, under a table -A could have merged."""
@@ -3440,6 +3510,14 @@ def main() -> None:
     elif command == "account":
         report_account(records, nok=nok)
         _note()
+    elif command == "model":
+        render_usage_split(aggregate.model_rows(local, nok), "Models", "Model", nok=nok)
+        if merge_all and remote.records:
+            console.print(
+                "[dim]Model report shows this machine; pulled totals have no model breakdown.[/dim]"
+            )
+    elif command == "tool":
+        render_usage_split(aggregate.tool_rows(records, nok), "Tools", "Tool", nok=nok)
     else:
         report_daily(records, breakdown=args.models, nok=nok)
         _note()
@@ -3454,6 +3532,14 @@ def main() -> None:
         # most of them — pays nothing for the check.
         if _accounts_worth_showing(records):
             report_account(records, nok=nok)
+        if any(r.source == "codex" for r in records):
+            render_usage_split(aggregate.model_rows(local, nok), "Models", "Model", nok=nok)
+            if merge_all and remote.records:
+                console.print(
+                    "[dim]Model report shows this machine; pulled totals have no model breakdown.[/dim]"
+                )
+            if len({r.source for r in records}) > 1:
+                render_usage_split(aggregate.tool_rows(records, nok), "Tools", "Tool", nok=nok)
 
 
 if __name__ == "__main__":

@@ -26,9 +26,12 @@ class TestEnvironmentIsolation:
     """The developer's shell must not reach the code under test."""
 
     def test_every_named_variable_is_gone(self):
-        """All but the one isolate_cache_db sets for itself, right after."""
+        """All but the settings isolate_cache_db replaces with safe test values."""
         leaked = set(CONFIGURED_BY_ENV) & set(os.environ)
-        assert leaked == {"CLAUDE_CACHE_SNAPSHOT_DISABLE"}
+        assert leaked == {"CLAUDE_CACHE_SNAPSHOT_DISABLE", "CODEX_HOME"}
+
+    def test_codex_home_is_a_private_test_directory(self, tmp_path):
+        assert os.environ["CODEX_HOME"] == str(tmp_path / "codex")
 
     def test_the_snapshot_disable_is_the_suite_s_own_and_not_inherited(self):
         assert os.environ["CLAUDE_CACHE_SNAPSHOT_DISABLE"] == "1"

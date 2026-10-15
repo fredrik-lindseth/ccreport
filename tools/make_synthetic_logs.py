@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write synthetic Claude Code session logs for scan.parse_jsonl_file to read.
+"""Write synthetic Claude Code logs, with optional Codex rollouts alongside them.
 
 Run it with `uv run python tools/make_synthetic_logs.py <out_dir>`; it imports
 ccreport.pricing for the projects-dir encoding rather than spelling that rule a
@@ -239,6 +239,118 @@ def write_corpus(
     return expected
 
 
+@dataclass(frozen=True)
+class CodexExpected:
+    """One independently specified call in the small Codex compatibility corpus."""
+
+    path: Path
+    response_id: str
+    session_id: str
+    thread_id: str
+    model: str
+    account_uuid: str | None
+    input_tokens: int
+    cached_input_tokens: int
+    output_tokens: int
+    reasoning_output_tokens: int
+
+
+def _codex_event(kind: str, payload: dict, ordinal: int) -> dict:
+    return {"type": kind, "payload": payload, "ordinal": ordinal,
+            "timestamp": "2026-10-15T12:00:00Z"}
+
+
+def _codex_call(exp: CodexExpected, turn: str, ordinal: int) -> dict:
+    return _codex_event("token_usage_record", {
+        "response_id": exp.response_id, "session_id": exp.session_id,
+        "thread_id": exp.thread_id, "turn_id": turn,
+        "usage": {
+            "input_tokens": exp.input_tokens,
+            "cached_input_tokens": exp.cached_input_tokens,
+            "cache_write_input_tokens": 0,
+            "output_tokens": exp.output_tokens,
+            "reasoning_output_tokens": exp.reasoning_output_tokens,
+            "total_tokens": exp.input_tokens + exp.output_tokens,
+        },
+    }, ordinal)
+
+
+def write_codex_corpus(out_dir: Path, *, seed: int = 0) -> list[CodexExpected]:
+    """Write deterministic root, fork and guardian rollouts under a Codex home.
+
+    This is separate from write_corpus so existing Claude fixtures retain their
+    exact shape. Both token event forms, model changes, inherited parent history,
+    missing turn context, archived sessions and unknown accounts are included.
+    The returned counts are per call; cumulative events add no expected rows.
+    """
+    rng = random.Random(seed)
+    root, child, guardian = (str(uuid.UUID(int=rng.getrandbits(128))) for _ in range(3))
+    active = out_dir / "sessions/2026/10/15"
+    root_path, child_path = active / f"rollout-{root}.jsonl", active / f"rollout-{child}.jsonl"
+    guardian_path = out_dir / "archived_sessions" / f"rollout-{guardian}.jsonl"
+    expected = [
+        CodexExpected(root_path, _token(rng, "resp_", 16), root, root,
+                      "gpt-6-astra", "synthetic-chatgpt-account", 1000, 800, 100, 40),
+        CodexExpected(root_path, _token(rng, "resp_", 16), root, root,
+                      "gpt-6.1-sol", "synthetic-chatgpt-account", 2000, 1800, 200, 70),
+        CodexExpected(child_path, _token(rng, "resp_", 16), root, child,
+                      "gpt-5.6-terra", "synthetic-chatgpt-account", 3000, 2800, 150, 50),
+        CodexExpected(child_path, _token(rng, "resp_", 16), root, child,
+                      "gpt-5.6-terra", "synthetic-chatgpt-account", 4000, 3800, 250, 90),
+        CodexExpected(guardian_path, _token(rng, "resp_", 16), root, guardian,
+                      "codex-auto-review", None, 500, 400, 20, 5),
+    ]
+    cwd = _make_cwd(out_dir, "alpha")
+    root_meta = {
+        "id": root, "session_id": root, "cwd": cwd, "thread_source": "user",
+        "creator_account_id": "synthetic-chatgpt-account",
+        "git": {"repository_url": "https://example.test/synthetic/alpha.git"},
+    }
+    root_lines = [
+        _codex_event("session_meta", root_meta, 0),
+        _codex_event("turn_context", {"turn_id": "first", "model": "gpt-6-astra"}, 1),
+        _codex_call(expected[0], "first", 2),
+        _codex_event("turn_context", {"turn_id": "second", "model": "gpt-6.1-sol"}, 3),
+        _codex_call(expected[1], "second", 4),
+    ]
+    child_lines = [
+        _codex_event("session_meta", {
+            **root_meta, "id": child, "thread_source": "subagent", "forked_from_id": root,
+            "parent_thread_id": root, "subagent_history_start_ordinal": 4,
+        }, 0),
+        _codex_event("session_meta", root_meta, 1),
+        _codex_event("turn_context", {"turn_id": "first", "model": "gpt-6-astra"}, 2),
+        _codex_call(expected[0], "first", 3),
+        _codex_event("turn_context", {"turn_id": "child", "model": "gpt-5.6-terra"}, 4),
+        _codex_call(expected[2], "child", 5),
+        _codex_call(expected[3], "missing-context", 6),
+    ]
+    guardian_lines = [
+        _codex_event("session_meta", {
+            **root_meta, "id": guardian, "thread_source": "guardian_review", "creator_account_id": None,
+        }, 0),
+        _codex_event("turn_context", {"turn_id": "review", "model": "codex-auto-review"}, 1),
+        _codex_call(expected[4], "review", 2),
+    ]
+    for path, lines in ((root_path, root_lines), (child_path, child_lines), (guardian_path, guardian_lines)):
+        total = {"input_tokens": 0, "output_tokens": 0}
+        written = []
+        for line in lines:
+            written.append(line)
+            if line["type"] == "token_usage_record":
+                usage = line["payload"]["usage"]
+                for key in total:
+                    total[key] += usage[key]
+                counter = _codex_event("event_msg", {
+                    "type": "token_count",
+                    "info": {"total_token_usage": dict(total), "last_token_usage": usage},
+                }, line["ordinal"])
+                written.extend([counter, counter])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(json.dumps(line) for line in written) + "\n")
+    return expected
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("out_dir", type=Path, help="directory to write projects/ and repos/ into")
@@ -246,6 +358,7 @@ def main() -> int:
     ap.add_argument("--projects", type=int, default=3)
     ap.add_argument("--sessions", type=int, default=3, help="sessions per project")
     ap.add_argument("--days", type=int, default=7, help="how many days the records span")
+    ap.add_argument("--codex", action="store_true", help="also write a small Codex corpus under codex/")
     ap.add_argument("--end", type=datetime.fromisoformat, default=ANCHOR_END,
                     help=f"instant the newest record sits before (default {ANCHOR_END.isoformat()})")
     args = ap.parse_args()
@@ -257,6 +370,9 @@ def main() -> int:
     )
     files = sorted({r.path for r in records})
     print(f"{len(records)} assistant records in {len(files)} sessions under {args.out_dir / 'projects'}")
+    if args.codex:
+        codex_records = write_codex_corpus(args.out_dir / "codex", seed=args.seed)
+        print(f"{len(codex_records)} Codex calls under {args.out_dir / 'codex'}")
     return 0
 
 

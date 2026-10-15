@@ -1,4 +1,4 @@
-"""Read Claude Code's JSONL session logs into the cache the reports run off.
+"""Read Claude Code and Codex JSONL session logs into the shared report cache.
 
 Separate from ccreport.py because the detached push client sends what these
 tables hold and imports no rich, as accounts.py is separate for the same
@@ -16,7 +16,7 @@ from typing import NamedTuple
 
 import orjson
 
-from ccreport import project_identity
+from ccreport import codex_scan, project_identity
 from ccreport.aggregate import TokenCounts, UsageRecord
 from ccreport.cache_db import (
     check_ccreport_valid,
@@ -91,7 +91,7 @@ def _resolve_remote(cwd: str) -> str | None:
 # every edit here, this comment included, so it can say only "something changed",
 # never "the stored format did". This is the deliberate knob on the reader's
 # side of the contract, as the salt is on cache_db's.
-CACHE_VERSION = 2
+CACHE_VERSION = 4
 
 # Freshly parsed files buffered before one write transaction. Small enough
 # that a full re-parse never holds the write lock across a long stretch of
@@ -103,7 +103,7 @@ _SAVE_BATCH = 250
 def _script_hash() -> str:
     """SHA256 of the project-naming inputs, used to invalidate the cache.
 
-    This module, project_identity.py, and the repo-roots config all shape the
+    This module, codex_scan.py, project_identity.py, and the repo-roots config shape the
     project names frozen into cached records at parse time, so editing any of
     them must trigger a re-parse. Nothing in ccreport.py does, since the parse
     moved here — a change to a report renderer no longer costs a corpus
@@ -119,6 +119,7 @@ def _script_hash() -> str:
     try:
         h.update(Path(__file__).read_bytes())
         h.update(Path(project_identity.__file__).read_bytes())
+        h.update(Path(codex_scan.__file__).read_bytes())
     except OSError:
         return ""
     try:
@@ -144,6 +145,9 @@ def _serialize_records(records: list) -> list[dict]:
     """Convert UsageRecords to compact cache dicts."""
     return [
         {
+            **({"source": r.source, "account_uuid": r.account_uuid,
+                "thread_id": r.thread_id, "reasoning_output_tokens": r.reasoning_output_tokens}
+               if r.source != "claude" else {}),
             "mid": r.message_id,
             "model": r.model,
             "ts": r.timestamp.timestamp(),
@@ -165,6 +169,10 @@ def _deserialize_records(raw: list[dict]) -> list:
     """Convert compact cache dicts back to UsageRecords."""
     return [
         UsageRecord(
+            source=r.get("source", "claude"),
+            account_uuid=r.get("account_uuid"),
+            thread_id=r.get("thread_id"),
+            reasoning_output_tokens=r.get("reasoning_output_tokens", 0),
             message_id=r["mid"],
             model=r["model"],
             timestamp=datetime.fromtimestamp(r["ts"], tz=UTC),
@@ -198,7 +206,8 @@ def discover_jsonl_files() -> list[Path]:
     for d in _PROJECT_ROOTS:
         if d.is_dir():
             files.extend(d.rglob("*.jsonl"))
-    return sorted(files)
+    files.extend(codex_scan.discover_codex_files())
+    return sorted(set(files))
 
 
 def _resolve_from_filesystem(dir_name: str) -> str | None:
@@ -420,7 +429,10 @@ def _refresh_changed_files(
         if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
             continue
         try:
-            records, turns = parse_jsonl(path)
+            if codex_scan.is_codex_file(path):
+                records, turns = codex_scan.parse_rollout_file(path), []
+            else:
+                records, turns = parse_jsonl(path)
         except (OSError, UnicodeDecodeError):
             # Skipping the save leaves the file's previous cache entry whole;
             # this run under-reports it, the next readable parse restores it.

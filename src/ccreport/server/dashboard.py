@@ -36,7 +36,7 @@ DEFAULT_RANGE = ALL_TIME
 EMPTY_SPAN_DAYS = 30
 """How wide all-time is when there is nothing stored to measure it from."""
 
-DIMENSIONS = ("model", "day", "week", "month", "project", "machine")
+DIMENSIONS = ("model", "tool", "day", "week", "month", "project", "machine")
 """What the breakdown table switches between. Same columns throughout.
 
 The three periods run day, week, month so a row leads to the page one step
@@ -295,7 +295,7 @@ def _tiles(merged: list[reports.MergedRecord], total_cost: float) -> list[Tile]:
     ]
 
 
-SLICE_SCOPES = ("model", "project", "machine")
+SLICE_SCOPES = ("model", "tool", "project", "machine")
 """Pages whose spend is one part of what the subscription bought.
 
 The multiple is worth showing there — one project outrunning the whole plan by
@@ -465,6 +465,7 @@ def _chart(merged: list[reports.MergedRecord], axis: list[str],
 _DIMENSION_KEYS = {
     "account": lambda item: item.account,
     "model": lambda item: item.record.model,
+    "tool": lambda item: item.record.source,
     "day": lambda item: item.record.day_key(),
     "week": lambda item: week_key(item.record.day_key()),
     "month": lambda item: item.record.day_key()[:7],

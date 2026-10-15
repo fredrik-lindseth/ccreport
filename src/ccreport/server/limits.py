@@ -210,6 +210,7 @@ def _spend_indexes(
     until = datetime.fromtimestamp(max(i.peak_ts for _a, i, _m in instances), tz=UTC)
     named = {account for account, _i, _m in instances}
     per_account = reports.load_spend(conn, reports.Filters(
+        tool="claude",
         since=since, until=until + timedelta(seconds=1),
         account=next(iter(named)) if len(named) == 1 else None,
     ))
@@ -455,6 +456,7 @@ def _window_records(
     instance = row.instance
     start = instance.started_at if instance.started_at is not None else instance.first_ts
     merged = reports.load_bucketed(conn, reports.Filters(
+        tool="claude",
         since=datetime.fromtimestamp(start, tz=UTC),
         until=datetime.fromtimestamp(instance.resets_at, tz=UTC),
         account=row.account,
