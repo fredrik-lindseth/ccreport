@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Development
+
+- **Dependencies move to latest: fastapi 0.143.5, orjson 3.13.0, ruff 0.17.1 and pyright 1.1.414.**
+
 ## 0.2.1 (2026-10-15)
 
 ### Added
