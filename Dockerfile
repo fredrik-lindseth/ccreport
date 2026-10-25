@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM ghcr.io/astral-sh/uv:python3.13-alpine@sha256:e9a8312ed6a98f515208dd792c61178a0b7c8fbfb807af01534f0e6fe10b24f5 AS builder
+FROM ghcr.io/astral-sh/uv:0.13.5-python3.13-alpine@sha256:1fd17509ae6051e6cad9dc1b83705483c0b24a15740b3c4d230b6b6f2e2a0241 AS builder
 
 RUN --mount=type=cache,sharing=locked,target=/var/cache/apk apk update && apk add git
 
@@ -11,7 +11,7 @@ COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache uv sync --no-dev --no-install-project --frozen \
     && find /app/.venv -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; true
 
-FROM ghcr.io/astral-sh/uv:python3.13-alpine@sha256:e9a8312ed6a98f515208dd792c61178a0b7c8fbfb807af01534f0e6fe10b24f5
+FROM ghcr.io/astral-sh/uv:0.13.5-python3.13-alpine@sha256:1fd17509ae6051e6cad9dc1b83705483c0b24a15740b3c4d230b6b6f2e2a0241
 
 RUN apk add --no-cache sqlite bash
 
