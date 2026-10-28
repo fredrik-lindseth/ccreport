@@ -33,6 +33,7 @@ from ccreport import (
     protocol,
     sources,
     speed,
+    startup,
     tier_timeline,
 )
 from ccreport.accounts import AccountTimeline
@@ -279,6 +280,7 @@ def load_all_records(
     *,
     use_rollups: bool = False,
     tool_filter: str | None = None,
+    cached_only: bool = False,
 ) -> list[UsageRecord]:
     """Load and deduplicate all usage records.
 
@@ -292,22 +294,38 @@ def load_all_records(
     needs record-level detail (a filter, --json, adopt) gets the full stream
     without having to know rollups exist.
 
+    *cached_only* reads stored records and the archive without discovering or
+    parsing logs or invalidating the cache. It is a provisional preview, using
+    the same attribution, deduplication and filters as a refreshed report.
+
     Raises ValueError when *use_rollups* arrives with any of *since*, *until*,
     *project_filter* or *account_filter*: a rollup row is one day of one session
     and has aggregated away what those four select on.
     """
-    files = discover_jsonl_files()
-    live_paths = {str(p) for p in files}
-    _ensure_cache_valid(live_paths)
-    if use_rollups:
-        if since or until or project_filter or account_filter:
-            raise ValueError(
-                "rollups aggregate away what a filter selects on; "
-                "load the full record stream instead"
-            )
-        records = _load_with_rollups(files, live_paths)
+    if use_rollups and (since or until or project_filter or account_filter or cached_only):
+        raise ValueError(
+            "rollups aggregate away what a filter selects on; load the full record stream instead"
+        )
+    if cached_only:
+        # No discovery, validation, parsing or rollup rebuild: these are the
+        # last stored readings, explicitly labelled as such by the caller.
+        files = [Path(key) for key in sorted(load_ccreport_file_meta())]
+        records = _load_full(
+            files, set(), since, until, project_filter, account_filter,
+            refreshed=({}, set()),
+        )
     else:
-        records = _load_full(files, live_paths, since, until, project_filter, account_filter)
+        with startup.phase("discovery"):
+            files = discover_jsonl_files()
+        startup.count("discovered_files", len(files))
+        live_paths = {str(p) for p in files}
+        with startup.phase("cache_validation"):
+            _ensure_cache_valid(live_paths)
+        with startup.phase("records_and_rollups"):
+            if use_rollups:
+                records = _load_with_rollups(files, live_paths)
+            else:
+                records = _load_full(files, live_paths, since, until, project_filter, account_filter)
     # The cache still holds what a tool switched off in `sources` logged before
     # it was; the rollups do too, since a rollup row carries its source.
     enabled = sources.enabled_sources()
@@ -340,7 +358,10 @@ def _load_full(
     all_records: list[UsageRecord] = []
 
     if refreshed is None:
-        fresh, unreadable = _refresh_changed_files(files, load_ccreport_file_meta())
+        with startup.phase("parse_changed_files"):
+            fresh, unreadable = _refresh_changed_files(files, load_ccreport_file_meta())
+        startup.count("parsed_files", len(fresh))
+        startup.count("unreadable_files", len(unreadable))
     else:
         fresh, unreadable = refreshed
 
@@ -645,7 +666,10 @@ def _load_with_rollups(files: list[Path], live_paths: set[str]) -> list[UsageRec
     # records older than the cutoff. Catching up first means a change shows up
     # on the run that saw it, not on the one after.
     file_meta = load_ccreport_file_meta()
-    refreshed = _refresh_changed_files(files, file_meta)
+    with startup.phase("parse_changed_files"):
+        refreshed = _refresh_changed_files(files, file_meta)
+    startup.count("parsed_files", len(refreshed[0]))
+    startup.count("unreadable_files", len(refreshed[1]))
     unreadable = refreshed[1]
 
     # Cached files no longer on disk. Taken from the pre-refresh metadata,
@@ -665,7 +689,8 @@ def _load_with_rollups(files: list[Path], live_paths: set[str]) -> list[UsageRec
             files, live_paths, None, None, None, None,
             refreshed=refreshed, accounts=AccountTimeline(events),
         )
-        _build_rollups(records, cutoff_ts, fingerprint)
+        with startup.phase("build_rollups"):
+            _build_rollups(records, cutoff_ts, fingerprint)
         return records
 
     filters = _keep_filters(None, None, None, None, accounts=AccountTimeline(events))
@@ -3211,6 +3236,8 @@ def main() -> None:
         p.add_argument("--account", "-a", help="Filter by account email (substring match)")
         p.add_argument("--tool", choices=sources.TOOL_NAMES, default=argparse.SUPPRESS,
                        help="Filter by originating tool")
+        p.add_argument("--debug", action="store_true", default=argparse.SUPPRESS,
+                       help="Print startup phase timings to stderr")
         p.add_argument("--json", "-j", action="store_true", help="Output as JSON")
         p.add_argument("--no-mva", action="store_true", help="Show NOK without 25%% MVA")
         # SUPPRESS, not None: a subparser argument with a default overwrites
@@ -3384,6 +3411,7 @@ def main() -> None:
     parser.add_argument("--server", help="Render the merged reports from this ccreport server")
     parser.add_argument("--machine", help="With --server: only this machine's records")
 
+    parser.add_argument("--debug", action="store_true", help="Print startup phase timings to stderr")
     args = parser.parse_args()
 
     # First, and before any of the branches below can open the DB: get_connection
@@ -3461,6 +3489,12 @@ def main() -> None:
         cmd_server_report(args)
         return
 
+    interactive = console.is_terminal and not bool(getattr(args, "json", False))
+    with startup.ReportRun(debug=args.debug) as run:
+        _run_local_report(args, run, interactive=interactive)
+
+
+def _run_local_report(args: argparse.Namespace, run: startup.ReportRun, *, interactive: bool) -> None:
     mva = not args.no_mva
 
     since = parse_date(args.since) if args.since else None
@@ -3469,6 +3503,12 @@ def main() -> None:
     account_filter = args.account if hasattr(args, "account") else None
 
     wants_json = bool(getattr(args, "json", False))
+    if interactive:
+        console.print("[dim]Loading cached usage; updating agent-tool logs may take a while…[/dim]")
+        console.print(run.age_message(), style="dim")
+        with startup.phase("cached_preview"):
+            _show_cached_report(args, since, until, project_filter, account_filter)
+        console.print("[dim]… Fetching updated information from local agent-tool logs…[/dim]")
     # Off before the corpus load rather than after it: the request does not
     # depend on which records come back, only on which recent dates the rate
     # cache is still short of, so it runs while the records are being read.
@@ -3485,6 +3525,9 @@ def main() -> None:
             tool_filter=args.tool,
         )
 
+    run.indexing_completed()
+    startup.count("loaded_rows", len(records))
+
     # Local rows alone, always. -A merges the pulled tables below; without it
     # they answer the note under each table instead. Either way `ccreport` opens
     # no socket: these are local rows a detached pull wrote.
@@ -3496,7 +3539,6 @@ def main() -> None:
     # even under -A: a pulled row is one day of one machine and carries no
     # session, so merging would add a bucket with no name to a table keyed on it.
     local = records
-    note = "" if merge_all else _remote_note(remote)
     if merge_all:
         records = sorted(records + remote.records, key=lambda r: r.timestamp)
 
@@ -3506,7 +3548,10 @@ def main() -> None:
         sys.exit(1)
 
     # Bulk-load exchange rates for all records
-    nok, has_full_coverage = load_rates_for_records(records, mva=mva, prefetch=prefetch)
+    if interactive:
+        console.print("[dim]… Loading exchange rates…[/dim]")
+    with startup.phase("exchange_rates"):
+        nok, has_full_coverage = load_rates_for_records(records, mva=mva, prefetch=prefetch)
     if nok.enabled and not has_full_coverage:
         print("⚠ Some dates lack exchange rate data; NOK values are partial.", file=sys.stderr)
 
@@ -3517,6 +3562,20 @@ def main() -> None:
         _print_import_diagnostics(import_notes)
         return
 
+    if interactive:
+        console.print("\n[bold]Updated report[/bold]")
+    with startup.phase("render_updated"):
+        _render_local_report(args, records, local, remote, nok)
+
+    _print_import_diagnostics(import_notes)
+
+
+def _render_local_report(
+    args: argparse.Namespace, records: list[UsageRecord], local: list[UsageRecord],
+    remote: RemoteSpend, nok: NokCtx,
+) -> None:
+    merge_all = bool(getattr(args, "all", False))
+    note = "" if merge_all else _remote_note(remote)
     command = args.command
     unpriced = sum(
         r.count for r in records
@@ -3586,7 +3645,28 @@ def main() -> None:
             if len({r.source for r in records}) > 1:
                 render_usage_split(aggregate.tool_rows(records, nok), "Tools", "Tool", nok=nok)
 
-    _print_import_diagnostics(import_notes)
+
+def _show_cached_report(
+    args: argparse.Namespace, since: datetime | None, until: datetime | None,
+    project_filter: str | None, account_filter: str | None,
+) -> None:
+    local = load_all_records(
+        since=since, until=until, project_filter=project_filter,
+        account_filter=account_filter, tool_filter=args.tool, cached_only=True,
+    )
+    remote = _remote_records(since, until, project_filter, account_filter)
+    if args.tool and not sources.is_claude(args.tool):
+        remote = RemoteSpend([], set())
+    records = sorted(local + remote.records, key=lambda r: r.timestamp) if args.all else local
+    if not records:
+        console.print("[dim]No cached usage yet. The first index may take a while.[/dim]")
+        return
+    console.print("\n[bold]Cached report — awaiting updated information[/bold]")
+    rates = exchange.read_rates_since(min(record_oslo_date(r) for r in records))
+    nok = NokCtx(rates, max(rates) if rates else None, not args.no_mva)
+    if nok.enabled:
+        console.print("[dim]NOK uses cached exchange rates; some dates may be missing or estimated.[/dim]")
+    _render_local_report(args, records, local, remote, nok)
 
 
 if __name__ == "__main__":

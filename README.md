@@ -216,6 +216,22 @@ ccreport --tool codex --json                # local calls, including reasoning m
 ccreport limits -w session                  # rate-limit window history
 ```
 
+Interactive local reports show a **Cached report** first, using the records and
+exchange rates already stored on this machine. It stays in terminal scrollback
+while the logs are refreshed; the **Updated report** follows below it. The
+startup message gives the number of days since the last completed report index
+when known. On the first run after upgrading, that timestamp is unknown.
+JSON and piped output contain only the final report.
+
+Startup timings are saved automatically to `startup-timings.json` beside
+`cache.db` (normally `~/.local/share/ccreport/`). The file holds the latest run's
+phase durations, file counts and completion status, including an interrupted
+run's current phase. `ccreport --debug` also prints timings to stderr; phase
+times can overlap because some phases contain others and exchange-rate
+prefetch runs during indexing. The file contains no log contents or project
+names. Each local report replaces it, so copy it before another run when
+investigating a slow startup.
+
 Costs are priced per record from a pricing table in `src/ccreport/pricing.py`,
 deduplicated by the log's own `message.id`/`requestId`, and grouped into
 projects by git remote, then repo-root path, then directory name. A rename the

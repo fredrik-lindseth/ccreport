@@ -2026,3 +2026,32 @@ multiple parts, fallback usage, forked history, child sessions, legacy/SQLite
 overlap, metadata fingerprints, malformed data, unsupported V2 and the absence
 of credential/account reads. Integration tests cover the shared cache and
 report pipeline separately.
+
+
+## 13. Interactive report startup and diagnostics
+
+A local terminal report first calls `load_all_records(cached_only=True)`.
+This reads `ccreport_records` and `ccreport_archive`, applying the same dedup,
+project overrides, account attribution, enabled sources and filters as the
+refreshed report. It never discovers logs, invalidates stored records, parses
+files or rebuilds rollups. Cached exchange rates are read through
+`exchange.read_rates_since`; no rate fetch is needed for the preview. With
+`-A`, the preview uses the same locally pulled remote rows and session/model
+limitations as the final report. The common renderer labels the preview as
+cached, keeps it in scrollback, and appends the updated report after the normal
+refresh. JSON and non-terminal stdout skip the preview and progress messages.
+The preview is provisional: stored records can reflect an older parser or
+project identity until refresh. Incompatible cached schemas return no rows
+through the existing passive-reader salt gate.
+
+`startup.ReportRun` atomically replaces `startup-timings.json` beside the
+client database. It records the latest local report's phase durations, counts,
+active phase stack and status; writes are best effort. Nested durations overlap,
+and exchange-rate prefetch overlaps corpus loading. Discovery, cache
+validation, changed-file parsing, record loading/rollups, rollup construction,
+exchange-rate wait/loading and rendering are measured separately. The last
+completed report index timestamp moves only after `load_all_records` returns;
+a failed or cancelled index preserves the prior timestamp. This dates a report
+index, not a detached push or status-line refresh. Until first measured it is
+unknown rather than inferred from a session log's mtime. No database schema,
+stored cost or calculation rule changes. `--debug` echoes durations to stderr.
