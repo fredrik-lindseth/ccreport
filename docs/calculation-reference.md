@@ -2029,19 +2029,22 @@ report pipeline separately.
 
 ## 13. Interactive report startup and diagnostics
 
-A local terminal report first calls `load_all_records(cached_only=True)`.
-This reads `ccreport_records` and `ccreport_archive`, applying the same dedup,
-project overrides, account attribution, enabled sources and filters as the
-refreshed report. It never discovers logs, invalidates stored records, parses
-files or rebuilds rollups. Cached exchange rates are read through
-`exchange.read_rates_since`; no rate fetch is needed for the preview. With
-`-A`, the preview uses the same locally pulled remote rows and session/model
-limitations as the final report. The common renderer labels the preview as
-cached, keeps it in scrollback, and appends the updated report after the normal
-refresh. JSON and non-terminal stdout skip the preview and progress messages.
-The preview is provisional: stored records can reflect an older parser or
-project identity until refresh. Incompatible cached schemas return no rows
-through the existing passive-reader salt gate.
+A local terminal report prints feedback immediately and looks for a saved
+rendering in `report-preview.json` beside `cache.db`. A snapshot matches only
+the same CLI options (excluding `--debug`), enabled sources and terminal width.
+It is labelled cached with its save time and remains in scrollback while the
+normal refresh runs. Missing, corrupt, incompatible or differently scoped
+snapshots are ignored. JSON and non-terminal stdout skip both preview and
+snapshot writes.
+
+The normal renderer emits its updated tables while Rich records that output;
+the plain text is saved only after the complete rendering succeeds. This adds
+no second database load, deduplication or aggregation. There is one snapshot,
+limited to 1 MiB, atomically replaced with mode 0600. A larger report removes
+an older snapshot rather than leaving it as the last successful rendering.
+A dated snapshot can be stale; it retains the prior exchange rates, account
+attribution and project names until refresh completes. It is not used to
+calculate any new total. The first run after upgrading has no snapshot.
 
 `startup.ReportRun` atomically replaces `startup-timings.json` beside the
 client database. It records the latest local report's phase durations, counts,

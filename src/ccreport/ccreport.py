@@ -280,7 +280,6 @@ def load_all_records(
     *,
     use_rollups: bool = False,
     tool_filter: str | None = None,
-    cached_only: bool = False,
 ) -> list[UsageRecord]:
     """Load and deduplicate all usage records.
 
@@ -294,38 +293,25 @@ def load_all_records(
     needs record-level detail (a filter, --json, adopt) gets the full stream
     without having to know rollups exist.
 
-    *cached_only* reads stored records and the archive without discovering or
-    parsing logs or invalidating the cache. It is a provisional preview, using
-    the same attribution, deduplication and filters as a refreshed report.
-
     Raises ValueError when *use_rollups* arrives with any of *since*, *until*,
     *project_filter* or *account_filter*: a rollup row is one day of one session
     and has aggregated away what those four select on.
     """
-    if use_rollups and (since or until or project_filter or account_filter or cached_only):
+    if use_rollups and (since or until or project_filter or account_filter):
         raise ValueError(
             "rollups aggregate away what a filter selects on; load the full record stream instead"
         )
-    if cached_only:
-        # No discovery, validation, parsing or rollup rebuild: these are the
-        # last stored readings, explicitly labelled as such by the caller.
-        files = [Path(key) for key in sorted(load_ccreport_file_meta())]
-        records = _load_full(
-            files, set(), since, until, project_filter, account_filter,
-            refreshed=({}, set()),
-        )
-    else:
-        with startup.phase("discovery"):
-            files = discover_jsonl_files()
-        startup.count("discovered_files", len(files))
-        live_paths = {str(p) for p in files}
-        with startup.phase("cache_validation"):
-            _ensure_cache_valid(live_paths)
-        with startup.phase("records_and_rollups"):
-            if use_rollups:
-                records = _load_with_rollups(files, live_paths)
-            else:
-                records = _load_full(files, live_paths, since, until, project_filter, account_filter)
+    with startup.phase("discovery"):
+        files = discover_jsonl_files()
+    startup.count("discovered_files", len(files))
+    live_paths = {str(p) for p in files}
+    with startup.phase("cache_validation"):
+        _ensure_cache_valid(live_paths)
+    with startup.phase("records_and_rollups"):
+        if use_rollups:
+            records = _load_with_rollups(files, live_paths)
+        else:
+            records = _load_full(files, live_paths, since, until, project_filter, account_filter)
     # The cache still holds what a tool switched off in `sources` logged before
     # it was; the rollups do too, since a rollup row carries its source.
     enabled = sources.enabled_sources()
@@ -3507,7 +3493,7 @@ def _run_local_report(args: argparse.Namespace, run: startup.ReportRun, *, inter
         console.print("[dim]Loading cached usage; updating agent-tool logs may take a while…[/dim]")
         console.print(run.age_message(), style="dim")
         with startup.phase("cached_preview"):
-            _show_cached_report(args, since, until, project_filter, account_filter)
+            _show_saved_report(args)
         console.print("[dim]… Fetching updated information from local agent-tool logs…[/dim]")
     # Off before the corpus load rather than after it: the request does not
     # depend on which records come back, only on which recent dates the rate
@@ -3565,7 +3551,7 @@ def _run_local_report(args: argparse.Namespace, run: startup.ReportRun, *, inter
     if interactive:
         console.print("\n[bold]Updated report[/bold]")
     with startup.phase("render_updated"):
-        _render_local_report(args, records, local, remote, nok)
+        _render_and_save_report(args, records, local, remote, nok, save=interactive)
 
     _print_import_diagnostics(import_notes)
 
@@ -3646,27 +3632,44 @@ def _render_local_report(
                 render_usage_split(aggregate.tool_rows(records, nok), "Tools", "Tool", nok=nok)
 
 
-def _show_cached_report(
-    args: argparse.Namespace, since: datetime | None, until: datetime | None,
-    project_filter: str | None, account_filter: str | None,
-) -> None:
-    local = load_all_records(
-        since=since, until=until, project_filter=project_filter,
-        account_filter=account_filter, tool_filter=args.tool, cached_only=True,
-    )
-    remote = _remote_records(since, until, project_filter, account_filter)
-    if args.tool and not sources.is_claude(args.tool):
-        remote = RemoteSpend([], set())
-    records = sorted(local + remote.records, key=lambda r: r.timestamp) if args.all else local
-    if not records:
-        console.print("[dim]No cached usage yet. The first index may take a while.[/dim]")
+def _preview_options(args: argparse.Namespace) -> dict:
+    # Exact options and layout only: a saved report must never answer a
+    # different filter, merge policy, tool selection or terminal width.
+    return {
+        "args": {key: value for key, value in vars(args).items() if key != "debug"},
+        "width": console.width, "sources": sorted(sources.enabled_sources()),
+    }
+
+
+def _show_saved_report(args: argparse.Namespace) -> None:
+    saved = startup.read_preview(_preview_options(args))
+    if saved is None:
+        console.print("[dim]No saved report for these options yet. Preparing an updated report…[/dim]")
         return
-    console.print("\n[bold]Cached report — awaiting updated information[/bold]")
-    rates = exchange.read_rates_since(min(record_oslo_date(r) for r in records))
-    nok = NokCtx(rates, max(rates) if rates else None, not args.no_mva)
-    if nok.enabled:
-        console.print("[dim]NOK uses cached exchange rates; some dates may be missing or estimated.[/dim]")
-    _render_local_report(args, records, local, remote, nok)
+    text, stamp = saved
+    when = datetime.fromtimestamp(stamp).astimezone().strftime("%Y-%m-%d %H:%M")
+    console.print(f"\n[bold]Cached report — saved {when}; awaiting updated information[/bold]")
+    # Already laid out at this width. Avoid interpreting project names as
+    # markup or turning URLs into links a second time.
+    console.print(text, end="", markup=False, highlight=False, emoji=False, soft_wrap=True)
+
+
+def _render_and_save_report(
+    args: argparse.Namespace, records: list[UsageRecord], local: list[UsageRecord],
+    remote: RemoteSpend, nok: NokCtx, *, save: bool,
+) -> None:
+    # Record while emitting normally: no second database load or second
+    # aggregation, and the first updated table still appears as it is drawn.
+    if not save or console.record:
+        _render_local_report(args, records, local, remote, nok)
+        return
+    console.record = True
+    try:
+        _render_local_report(args, records, local, remote, nok)
+    finally:
+        text = console.export_text(clear=True)
+        console.record = False
+    startup.save_preview(_preview_options(args), text)
 
 
 if __name__ == "__main__":

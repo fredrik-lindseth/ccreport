@@ -1,5 +1,6 @@
 """A slow refresh must leave useful, clearly provisional output in scrollback."""
 
+import argparse
 import io
 import json
 from datetime import UTC, datetime
@@ -7,7 +8,7 @@ from datetime import UTC, datetime
 import pytest
 from rich.console import Console
 
-from ccreport import aggregate, cache_db, scan, startup
+from ccreport import aggregate, cache_db, startup
 from ccreport import ccreport as ccr
 
 
@@ -20,25 +21,20 @@ def _record(**kwargs):
     })
 
 
-def _seed(records):
-    cache_db.init_ccreport_meta(scan.CACHE_VERSION, scan._script_hash())
-    cache_db.save_ccreport_file("/missing/log.jsonl", 1, 2, scan._serialize_records(records))
-
-
-def test_cached_load_never_discovers_parses_or_invalidates(monkeypatch):
-    _seed([_record(), _record(), _record(message_id="two", project="other")])
+def test_saved_preview_never_opens_database_or_logs(monkeypatch):
+    output = io.StringIO()
+    monkeypatch.setattr(ccr, "console", Console(file=output, force_terminal=True, color_system=None))
+    args = argparse.Namespace(command=None, tool=None, all=False, debug=False)
+    startup.save_preview(ccr._preview_options(args), "SPEND 1.0 [project] :smile:\n")
 
     def forbidden(*args, **kwargs):
-        pytest.fail("cached preview touched the logs or invalidated cached history")
+        pytest.fail("saved preview touched the database or logs")
 
-    for name in ("discover_jsonl_files", "_ensure_cache_valid", "_refresh_changed_files", "_build_rollups"):
-        monkeypatch.setattr(ccr, name, forbidden)
-    records = ccr.load_all_records(cached_only=True, project_filter="project")
-    assert len(records) == 1
-    assert records[0].cost() == 1.0
-    assert len(ccr.load_all_records(cached_only=True)) == 2
-    assert ccr.load_all_records(cached_only=True, tool_filter="codex") == []
-    assert ccr.load_all_records(cached_only=True, since=datetime(2026, 10, 16, tzinfo=UTC)) == []
+    monkeypatch.setattr(cache_db, "get_connection", forbidden)
+    monkeypatch.setattr(ccr, "load_all_records", forbidden)
+    monkeypatch.setattr(ccr.exchange, "read_rates_since", forbidden)
+    ccr._show_saved_report(args)
+    assert "SPEND 1.0 [project] :smile:" in output.getvalue()
 
 
 @pytest.mark.parametrize("interactive", [True, False])
@@ -48,7 +44,7 @@ def test_preview_is_visible_before_refresh_and_pipes_stay_clean(monkeypatch, int
     monkeypatch.setattr(ccr, "console", Console(file=output, force_terminal=interactive, color_system=None))
     monkeypatch.setattr(ccr.sys, "argv", ["ccreport", "--json"] if as_json else ["ccreport"])
     monkeypatch.setattr(ccr.exchange, "start_prefetch", lambda: None)
-    monkeypatch.setattr(ccr.exchange, "read_rates_since", lambda since: {})
+    monkeypatch.setattr(startup, "read_preview", lambda options: ("SPEND 1.0\n", 1_000_000.0))
     monkeypatch.setattr(ccr, "_remote_records", lambda *args: ccr.RemoteSpend([], set()))
     monkeypatch.setattr(ccr, "load_rates_for_records", lambda *a, **kw: (aggregate.NokCtx(), True))
     events = []
@@ -59,9 +55,6 @@ def test_preview_is_visible_before_refresh_and_pipes_stay_clean(monkeypatch, int
         ccr.console.print(f"SPEND {value}")
 
     def load(**kwargs):
-        if kwargs.get("cached_only"):
-            events.append("cached")
-            return [_record()]
         events.append("refresh")
         if interactive and not as_json:
             assert "Loading cached usage" in output.getvalue()
@@ -80,7 +73,9 @@ def test_preview_is_visible_before_refresh_and_pipes_stay_clean(monkeypatch, int
         assert json.loads(output.getvalue()) == [{"cost": 2.0}]
         assert events == ["refresh"]
     elif interactive:
-        assert events == ["cached", "render 1.0", "refresh", "render 2.0"]
+        assert events == ["refresh", "render 2.0"]
+        saved = json.loads(cache_db.DB_PATH.with_name("report-preview.json").read_text())
+        assert saved["text"] == "SPEND 2.0\n"
         assert output.getvalue().index("Updated report") > output.getvalue().index("SPEND 1.0")
     else:
         assert output.getvalue() == "SPEND 2.0\n"
@@ -96,7 +91,7 @@ def test_empty_preview_does_not_prevent_first_index(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         ccr.main()
     assert exc.value.code == 1
-    assert "No cached usage yet" in output.getvalue()
+    assert "No saved report for these options yet" in output.getvalue()
     data = json.loads(cache_db.DB_PATH.with_name("startup-timings.json").read_text())
     assert data["last_indexed_at"] is not None
     assert data["counts"]["discovered_files"] == 0
@@ -155,3 +150,66 @@ def test_debug_durations_go_to_stderr(capsys):
     assert output.out == ""
     assert "Startup timings:" in output.err
     assert "discovery:" in output.err
+
+
+@pytest.mark.parametrize("options", [
+    {"args": {"tool": "codex"}, "width": 120},
+    {"args": {"tool": "claude"}, "width": 80},
+    {"args": {"tool": "claude", "all": True}, "width": 120},
+])
+def test_saved_preview_requires_matching_options(options):
+    original = {"args": {"tool": "claude"}, "width": 120}
+    startup.save_preview(original, "cached report")
+    assert startup.read_preview(original) is not None
+    assert startup.read_preview(options) is None
+
+
+def test_saved_preview_is_bounded_private_and_replaces_previous():
+    startup.save_preview({}, "old")
+    startup.save_preview({}, "new")
+    saved = startup.read_preview({})
+    assert saved is not None
+    assert saved[0] == "new"
+    path = cache_db.DB_PATH.with_name("report-preview.json")
+    assert path.stat().st_mode & 0o777 == 0o600
+    startup.save_preview({}, "x" * (startup._PREVIEW_MAX_BYTES + 1))
+    assert startup.read_preview({}) is None
+    assert not path.exists()
+
+
+@pytest.mark.parametrize("contents", [
+    "broken", "[]", '{"schema": 1, "options": {}, "text": "x", "saved_at": "bad"}',
+])
+def test_corrupt_preview_is_ignored(contents):
+    cache_db.DB_PATH.with_name("report-preview.json").write_text(contents)
+    assert startup.read_preview({}) is None
+
+
+def test_failed_render_keeps_last_successful_snapshot_and_clears_recording(monkeypatch):
+    output = io.StringIO()
+    monkeypatch.setattr(ccr, "console", Console(file=output, force_terminal=True, color_system=None))
+    args = argparse.Namespace(command=None, tool=None, all=False, debug=False)
+    startup.save_preview(ccr._preview_options(args), "last success")
+
+    def fail(*args, **kwargs):
+        ccr.console.print("partial report")
+        raise ValueError("render failed")
+
+    monkeypatch.setattr(ccr, "_render_local_report", fail)
+    with pytest.raises(ValueError, match="render failed"):
+        ccr._render_and_save_report(args, [], [], ccr.RemoteSpend([], set()), aggregate.NokCtx(), save=True)
+    assert not ccr.console.record
+    ccr.console.record = True
+    assert ccr.console.export_text() == ""
+    ccr.console.record = False
+    saved = startup.read_preview(ccr._preview_options(args))
+    assert saved is not None
+    assert saved[0] == "last success"
+
+
+def test_source_policy_change_skips_saved_report(monkeypatch):
+    args = argparse.Namespace(command=None, tool=None, all=False, debug=False)
+    monkeypatch.setattr(ccr.sources, "enabled_sources", lambda: frozenset({"claude", "codex"}))
+    startup.save_preview(ccr._preview_options(args), "includes Codex")
+    monkeypatch.setattr(ccr.sources, "enabled_sources", lambda: frozenset({"claude"}))
+    assert startup.read_preview(ccr._preview_options(args)) is None

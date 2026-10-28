@@ -13,6 +13,8 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
+from datetime import UTC, datetime
+from pathlib import Path
 from types import TracebackType
 from typing import Self
 
@@ -63,18 +65,7 @@ class ReportRun:
 
     def save(self) -> None:
         """Replace the previous diagnostic atomically; failures never block a report."""
-        temporary = self.path.with_suffix(f".{os.getpid()}.tmp")
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary.write_text(json.dumps(self.data, indent=2) + "\n")
-            temporary.replace(self.path)
-        except OSError:
-            pass
-        finally:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
+        _write_json(self.path, self.data)
 
     def age_message(self) -> str:
         stamp = self.data["last_indexed_at"]
@@ -117,3 +108,62 @@ def count(name: str, value: int) -> None:
     run = _active.get()
     if run is not None:
         run.data["counts"][name] = value
+
+
+_PREVIEW_MAX_BYTES = 1024 * 1024
+_PREVIEW_SCHEMA = 1
+
+
+def _write_json(path: Path, data: dict) -> None:
+    temporary = path.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # A saved report contains local project/account names, like cache.db.
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(data, stream, ensure_ascii=False)
+            stream.write("\n")
+        temporary.replace(path)
+    except OSError:
+        pass
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def save_preview(options: dict, text: str) -> None:
+    """Keep one bounded, private snapshot of a successfully rendered report."""
+    path = cache_db.DB_PATH.with_name("report-preview.json")
+    if len(text.encode()) > _PREVIEW_MAX_BYTES:
+        # Do not leave an older snapshot looking like the latest saved report.
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+    _write_json(path, {
+        "schema": _PREVIEW_SCHEMA, "options": options, "text": text, "saved_at": time.time(),
+    })
+
+
+def read_preview(options: dict) -> tuple[str, float] | None:
+    """Return a matching saved layout without opening the database or logs."""
+    path = cache_db.DB_PATH.with_name("report-preview.json")
+    try:
+        if path.stat().st_size > _PREVIEW_MAX_BYTES * 2:
+            return None
+        data = json.loads(path.read_text())
+        if data.get("schema") != _PREVIEW_SCHEMA or data.get("options") != options:
+            return None
+        text, stamp = data.get("text"), data.get("saved_at")
+        if not isinstance(text, str) or not isinstance(stamp, (int, float)):
+            return None
+        if not 0 < stamp <= time.time() or len(text.encode()) > _PREVIEW_MAX_BYTES:
+            return None
+        # Validate the timestamp before the CLI converts it on any platform.
+        datetime.fromtimestamp(stamp, tz=UTC)
+        return text, stamp
+    except (OSError, ValueError, AttributeError, OverflowError):
+        return None

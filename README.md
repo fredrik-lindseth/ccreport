@@ -216,12 +216,20 @@ ccreport --tool codex --json                # local calls, including reasoning m
 ccreport limits -w session                  # rate-limit window history
 ```
 
-Interactive local reports show a **Cached report** first, using the records and
-exchange rates already stored on this machine. It stays in terminal scrollback
-while the logs are refreshed; the **Updated report** follows below it. The
-startup message gives the number of days since the last completed report index
-when known. On the first run after upgrading, that timestamp is unknown.
+Interactive local reports immediately explain that logs are being updated and
+give the number of days since the last completed report index when known.
+If a previous report was saved with the same options, enabled tools and
+terminal width, it appears as a dated **Cached report** while the refresh runs.
+The **Updated report** follows below it; both stay in terminal scrollback.
+The first run after upgrading has no saved report or known index timestamp.
 JSON and piped output contain only the final report.
+
+`report-preview.json` beside `cache.db` holds one saved rendering, limited to
+1 MiB and written with mode 0600 because it contains report data. It is replaced
+after a successful interactive report. Changed options or terminal width skip
+the preview; reports larger than the limit are not saved. Showing this snapshot
+requires no extra database scan, aggregation or network request. The dated
+preview can be stale until the updated report arrives.
 
 Startup timings are saved automatically to `startup-timings.json` beside
 `cache.db` (normally `~/.local/share/ccreport/`). The file holds the latest run's
