@@ -2027,7 +2027,6 @@ overlap, metadata fingerprints, malformed data, unsupported V2 and the absence
 of credential/account reads. Integration tests cover the shared cache and
 report pipeline separately.
 
-
 ## 13. Interactive report startup and diagnostics
 
 A local terminal report first calls `load_all_records(cached_only=True)`.
@@ -2053,5 +2052,5 @@ exchange-rate wait/loading and rendering are measured separately. The last
 completed report index timestamp moves only after `load_all_records` returns;
 a failed or cancelled index preserves the prior timestamp. This dates a report
 index, not a detached push or status-line refresh. Until first measured it is
-unknown rather than inferred from a session log's mtime. No database schema,
-stored cost or calculation rule changes. `--debug` echoes durations to stderr.
+unknown rather than inferred from a session log's mtime. `--debug` echoes
+durations to stderr.
