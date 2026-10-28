@@ -464,6 +464,9 @@ class TestSaveBatching:
         cache_db.get_connection().set_trace_callback(seen.append)
         assert len(ccr.load_all_records()) == 12
         writes = [sql for sql in seen if sql.startswith(("INSERT", "UPDATE", "DELETE"))]
+        # Previously an all-hit report wrote nothing. Its one meta commit now
+        # dates completed indexing (also on detached pushes); file/record rows
+        # must still stay untouched on cache hits.
         assert len(writes) == 1, "an all-hit run writes only its completion timestamp"
         assert "ccreport_indexed_at" in writes[0]
         assert sum(sql == "COMMIT" for sql in seen) == 1

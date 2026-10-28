@@ -13,7 +13,7 @@ import sys
 import time
 import warnings
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -346,6 +346,8 @@ def _load_full(
     if refreshed is None:
         with startup.phase("parse_changed_files"):
             fresh, unreadable = _refresh_changed_files(files, load_ccreport_file_meta())
+        if not unreadable:
+            cache_db.record_ccreport_indexed_at(time.time())
         startup.count("parsed_files", len(fresh))
         startup.count("unreadable_files", len(unreadable))
     else:
@@ -657,6 +659,8 @@ def _load_with_rollups(files: list[Path], live_paths: set[str]) -> list[UsageRec
     startup.count("parsed_files", len(refreshed[0]))
     startup.count("unreadable_files", len(refreshed[1]))
     unreadable = refreshed[1]
+    if not unreadable:
+        cache_db.record_ccreport_indexed_at(time.time())
 
     # Cached files no longer on disk. Taken from the pre-refresh metadata,
     # which is complete for the question: anything the refresh added is a file
@@ -3491,54 +3495,55 @@ def _run_local_report(args: argparse.Namespace, run: startup.ReportRun, *, inter
     account_filter = args.account if hasattr(args, "account") else None
 
     wants_json = bool(getattr(args, "json", False))
-    if interactive:
-        console.print("[dim]Loading cached usage; updating agent-tool logs may take a while…[/dim]")
-        console.print(run.age_message(), style="dim")
-        with startup.phase("cached_preview"):
-            _show_saved_report(args)
-        console.print("[dim]… Fetching updated information from local agent-tool logs…[/dim]")
-    # Off before the corpus load rather than after it: the request does not
-    # depend on which records come back, only on which recent dates the rate
-    # cache is still short of, so it runs while the records are being read.
-    prefetch = exchange.start_prefetch()
-    with _import_diagnostics(args.tool) as import_notes:
-        records = load_all_records(
-            since=since, until=until,
-            project_filter=project_filter, account_filter=account_filter,
-            # A rollup row is one day of one session, so it can answer a report's
-            # totals and nothing finer. Every filter selects on something it has
-            # aggregated away, and --json prints one entry per API call.
-            use_rollups=not (since or until or project_filter or account_filter
-                             or wants_json),
-            tool_filter=args.tool,
-        )
+    preview_shown = False
+    with console.status("Loading local usage…") if interactive else nullcontext() as status:
+        if status is not None:
+            status.update(f"Updating agent-tool logs… {run.age_message()}")
+            if run.preview_due():
+                with startup.phase("cached_preview"):
+                    preview_shown = _show_saved_report(args)
+        # Off before the corpus load rather than after it: the request does not
+        # depend on which records come back, only on which recent dates the rate
+        # cache is still short of, so it runs while the records are being read.
+        prefetch = exchange.start_prefetch()
+        with _import_diagnostics(args.tool) as import_notes:
+            records = load_all_records(
+                since=since, until=until,
+                project_filter=project_filter, account_filter=account_filter,
+                # A rollup row is one day of one session, so it can answer a report's
+                # totals and nothing finer. Every filter selects on something it has
+                # aggregated away, and --json prints one entry per API call.
+                use_rollups=not (since or until or project_filter or account_filter
+                                 or wants_json),
+                tool_filter=args.tool,
+            )
 
-    startup.count("loaded_rows", len(records))
+        startup.count("loaded_rows", len(records))
 
-    # Local rows alone, always. -A merges the pulled tables below; without it
-    # they answer the note under each table instead. Either way `ccreport` opens
-    # no socket: these are local rows a detached pull wrote.
-    remote = _remote_records(since, until, project_filter, account_filter)
-    if args.tool and not sources.is_claude(args.tool):
-        remote = RemoteSpend([], set())
-    merge_all = bool(getattr(args, "all", False))
-    # `local` stays this machine's own throughout. The session report reads it
-    # even under -A: a pulled row is one day of one machine and carries no
-    # session, so merging would add a bucket with no name to a table keyed on it.
-    local = records
-    if merge_all:
-        records = sorted(records + remote.records, key=lambda r: r.timestamp)
+        # Local rows alone, always. -A merges the pulled tables below; without it
+        # they answer the note under each table instead. Either way `ccreport` opens
+        # no socket: these are local rows a detached pull wrote.
+        remote = _remote_records(since, until, project_filter, account_filter)
+        if args.tool and not sources.is_claude(args.tool):
+            remote = RemoteSpend([], set())
+        merge_all = bool(getattr(args, "all", False))
+        # `local` stays this machine's own throughout. The session report reads it
+        # even under -A: a pulled row is one day of one machine and carries no
+        # session, so merging would add a bucket with no name to a table keyed on it.
+        local = records
+        if merge_all:
+            records = sorted(records + remote.records, key=lambda r: r.timestamp)
 
-    if not records:
-        print("No usage records found.", file=sys.stderr)
-        _print_import_diagnostics(import_notes)
-        return 1
+        if not records:
+            print("No usage records found.", file=sys.stderr)
+            _print_import_diagnostics(import_notes)
+            return 1
 
-    # Bulk-load exchange rates for all records
-    if interactive:
-        console.print("[dim]… Loading exchange rates…[/dim]")
-    with startup.phase("exchange_rates"):
-        nok, has_full_coverage = load_rates_for_records(records, mva=mva, prefetch=prefetch)
+        # Bulk-load exchange rates for all records
+        if status is not None:
+            status.update("Loading exchange rates…")
+        with startup.phase("exchange_rates"):
+            nok, has_full_coverage = load_rates_for_records(records, mva=mva, prefetch=prefetch)
     if nok.enabled and not has_full_coverage:
         print("⚠ Some dates lack exchange rate data; NOK values are partial.", file=sys.stderr)
 
@@ -3549,7 +3554,7 @@ def _run_local_report(args: argparse.Namespace, run: startup.ReportRun, *, inter
         _print_import_diagnostics(import_notes)
         return 0
 
-    if interactive:
+    if preview_shown:
         console.print("\n[bold]Updated report[/bold]")
     with startup.phase("render_updated"):
         _render_and_save_report(args, records, local, remote, nok, save=interactive)
@@ -3650,17 +3655,17 @@ def _preview_options(args: argparse.Namespace) -> dict:
     }
 
 
-def _show_saved_report(args: argparse.Namespace) -> None:
+def _show_saved_report(args: argparse.Namespace) -> bool:
     saved = startup.read_preview(_preview_options(args))
     if saved is None:
-        console.print("[dim]No saved report for these options yet. Preparing an updated report…[/dim]")
-        return
+        return False
     text, stamp = saved
     when = datetime.fromtimestamp(stamp).astimezone().strftime("%Y-%m-%d %H:%M")
     console.print(f"\n[bold]Cached report (saved {when}; awaiting updated information)[/bold]")
     # Already laid out at this width. Avoid interpreting project names as
     # markup or turning URLs into links a second time.
     console.print(text, end="", markup=False, highlight=False, emoji=False, soft_wrap=True)
+    return True
 
 
 def _render_and_save_report(

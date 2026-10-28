@@ -216,36 +216,14 @@ ccreport --tool codex --json                # local calls, including reasoning m
 ccreport limits -w session                  # rate-limit window history
 ```
 
-Interactive local reports immediately explain that logs are being updated and
-give the number of days since the last completed index when known.
-If a previous report was saved with the same options, enabled tools, package
-version, configuration and terminal width, it appears as a dated **Cached report** while the refresh runs.
-The **Updated report** follows below it; both stay in terminal scrollback.
-A package upgrade invalidates the saved report. Scanner upgrades can also
-require a one-time re-index of existing logs. Until the first completed index,
-the index timestamp is unknown.
-JSON and piped output contain only the final report, including when
-`FORCE_COLOR` is set.
-
-The index timestamp is shared in SQLite by reports, detached pushes and the
-other commands that scan logs. Completed scans advance it atomically; a failed
-or unreadable scan leaves it alone, and overlapping writers cannot move it back.
-
-`report-preview.json` beside `cache.db` holds one saved rendering, limited to
-1 MiB and written with mode 0600 because it contains report data. It is replaced
-after a successful interactive report. Changed options, configuration, version
-or terminal width skip the preview; reports larger than the limit are not saved. Showing this snapshot
-requires no extra database scan, aggregation or network request. The dated
-preview can be stale until the updated report arrives.
-
-Startup timings are saved automatically to `startup-timings.json` beside
-`cache.db` (normally `~/.local/share/ccreport/`). The file holds the latest run's
-phase durations, file counts and completion status, including an interrupted
-run's current phase. `ccreport --debug` also prints timings to stderr; phase
-times can overlap because some phases contain others and exchange-rate
-prefetch runs during indexing. The file contains no log contents or project
-names. Each local report replaces it, so copy it before another run when
-investigating a slow startup.
+Interactive local reports show a temporary status while updating logs. When
+the last index is unknown or at least a day old, a matching saved report appears
+with its date, followed by the updated report. Warm runs, JSON and pipes show
+only the final report. The saved report (`report-preview.json`) and startup
+timings (`startup-timings.json`) live beside `cache.db`, normally in
+`~/.local/share/ccreport/`. `ccreport --debug` also prints timings to stderr;
+see the [calculation reference](docs/calculation-reference.md#13-interactive-report-startup-and-diagnostics)
+for details.
 
 Costs are priced per record from a pricing table in `src/ccreport/pricing.py`,
 deduplicated by the log's own `message.id`/`requestId`, and grouped into

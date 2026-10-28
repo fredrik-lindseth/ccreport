@@ -6,13 +6,31 @@ import json
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 from rich.console import Console
 
 from ccreport import aggregate, cache_db, scan, startup, update_check
 from ccreport import ccreport as ccr
+
+
+@pytest.fixture
+def status_events(monkeypatch):
+    events = []
+
+    @contextmanager
+    def status(self, message):
+        events.append(message)
+        try:
+            yield SimpleNamespace(update=events.append)
+        finally:
+            events.append("stopped")
+
+    monkeypatch.setattr(Console, "status", status)
+    return events
 
 
 def _record(**kwargs):
@@ -42,7 +60,10 @@ def test_saved_preview_never_opens_database_or_logs(monkeypatch):
 
 @pytest.mark.parametrize("interactive", [True, False])
 @pytest.mark.parametrize("as_json", [True, False])
-def test_preview_is_visible_before_refresh_and_pipes_stay_clean(monkeypatch, interactive, as_json):
+@pytest.mark.parametrize("index_age", [None, 0, 86399, 86400, 7 * 86400])
+def test_preview_is_visible_before_refresh_and_pipes_stay_clean(
+    monkeypatch, interactive, as_json, index_age, status_events,
+):
     output = io.StringIO()
     monkeypatch.setattr(ccr, "console", Console(file=output, force_terminal=interactive, color_system=None))
     monkeypatch.setattr(ccr.sys, "argv", ["ccreport", "--json"] if as_json else ["ccreport"])
@@ -51,22 +72,31 @@ def test_preview_is_visible_before_refresh_and_pipes_stay_clean(monkeypatch, int
     monkeypatch.setattr(startup, "read_preview", lambda options: ("SPEND 1.0\n", 1_000_000.0))
     monkeypatch.setattr(ccr, "_remote_records", lambda *args: ccr.RemoteSpend([], set()))
     monkeypatch.setattr(ccr, "load_rates_for_records", lambda *a, **kw: (aggregate.NokCtx(), True))
+    if index_age is not None:
+        cache_db.record_ccreport_indexed_at(startup.time.time() - index_age)
+    should_preview = interactive and not as_json and (index_age is None or index_age >= 86400)
     events = []
 
     def render(args, records, *rest):
+        if interactive:
+            assert status_events[-1] == "stopped"
+
         value = records[0].cost()
         events.append(f"render {value}")
         ccr.console.print(f"SPEND {value}")
 
     def load(**kwargs):
         events.append("refresh")
-        if interactive and not as_json:
-            assert "Loading cached usage" in output.getvalue()
+        if should_preview:
             assert "Cached report" in output.getvalue()
             assert "SPEND 1.0" in output.getvalue()
-            assert "Fetching updated information" in output.getvalue()
         else:
             assert output.getvalue() == ""
+        if interactive and not as_json:
+            assert status_events[0] == "Loading local usage…"
+            assert "Updating agent-tool logs" in status_events[-1]
+        else:
+            assert status_events == []
         return [_record(cost_usd=2.0)]
 
     monkeypatch.setattr(ccr, "load_all_records", load)
@@ -80,13 +110,18 @@ def test_preview_is_visible_before_refresh_and_pipes_stay_clean(monkeypatch, int
         assert events == ["refresh", "render 2.0"]
         saved = json.loads(cache_db.DB_PATH.with_name("report-preview.json").read_text())
         assert saved["text"] == "SPEND 2.0\n"
-        assert output.getvalue().index("Updated report") > output.getvalue().index("SPEND 1.0")
+        if should_preview:
+            assert output.getvalue().index("Updated report") > output.getvalue().index("SPEND 1.0")
+        else:
+            assert output.getvalue() == "SPEND 2.0\n"
+        assert "Loading" not in output.getvalue()
+        assert status_events[-1] == "stopped"
     else:
         assert output.getvalue() == "SPEND 2.0\n"
         assert events == ["refresh", "render 2.0"]
 
 
-def test_empty_preview_does_not_prevent_first_index(monkeypatch):
+def test_empty_preview_does_not_prevent_first_index(monkeypatch, status_events):
     output = io.StringIO()
     monkeypatch.setattr(ccr, "console", Console(file=output, force_terminal=True, color_system=None))
     monkeypatch.setattr(ccr.sys, "argv", ["ccreport"])
@@ -96,7 +131,8 @@ def test_empty_preview_does_not_prevent_first_index(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         ccr.main()
     assert exc.value.code == 1
-    assert "No saved report for these options yet" in output.getvalue()
+    assert output.getvalue() == ""
+    assert status_events[-1] == "stopped"
     data = json.loads(cache_db.DB_PATH.with_name("startup-timings.json").read_text())
     assert cache_db.read_ccreport_indexed_at() is not None
     assert data["status"] == "complete"
@@ -303,15 +339,16 @@ def test_unencodable_preview_does_not_fail_report():
     assert saved[0] == "valid"
 
 
-def test_index_stamp_is_shared_by_detached_push_and_reports(monkeypatch):
+@pytest.mark.parametrize("use_rollups", [False, True])
+def test_index_stamp_is_shared_by_detached_push_and_reports(monkeypatch, use_rollups):
     monkeypatch.setattr(scan, "discover_jsonl_files", list)
     monkeypatch.setattr(ccr, "discover_jsonl_files", list)
-    monkeypatch.setattr(scan.time, "time", lambda: 100.0)
+    monkeypatch.setattr(startup.time, "time", lambda: 100.0)
     from ccreport import push
     push.refresh_cache()
     assert cache_db.read_ccreport_indexed_at() == 100.0
-    monkeypatch.setattr(scan.time, "time", lambda: 200.0)
-    assert ccr.load_all_records() == []
+    monkeypatch.setattr(startup.time, "time", lambda: 200.0)
+    assert ccr.load_all_records(use_rollups=use_rollups) == []
     assert cache_db.read_ccreport_indexed_at() == 200.0
     with startup.ReportRun() as run:
         assert "less than a day" in run.age_message()
@@ -327,16 +364,28 @@ def test_index_stamp_cannot_move_back_between_connections():
     assert cache_db.read_ccreport_indexed_at() == 300.0
 
 
-def test_incomplete_scan_does_not_advance_index_stamp(monkeypatch, tmp_path):
+@pytest.fixture(params=["full", "rollups", "push"])
+def refresh(request, monkeypatch):
+    monkeypatch.setattr(scan, "discover_jsonl_files", list)
+    monkeypatch.setattr(ccr, "discover_jsonl_files", list)
+    if request.param == "push":
+        from ccreport import push
+        return push.refresh_cache
+    return lambda: ccr.load_all_records(use_rollups=request.param == "rollups")
+
+
+def test_incomplete_scan_does_not_advance_index_stamp(monkeypatch, tmp_path, refresh):
     cache_db.record_ccreport_indexed_at(100.0)
     monkeypatch.setattr(scan, "parse_jsonl", lambda p: (_ for _ in ()).throw(OSError("unreadable")))
     path = tmp_path / "session.jsonl"
     path.write_text("{}", encoding="utf-8")
-    scan._refresh_changed_files([path], {})
+    monkeypatch.setattr(scan, "discover_jsonl_files", lambda: [path])
+    monkeypatch.setattr(ccr, "discover_jsonl_files", lambda: [path])
+    refresh()
     assert cache_db.read_ccreport_indexed_at() == 100.0
 
 
-def test_failed_scan_does_not_advance_index_stamp(monkeypatch):
+def test_failed_scan_does_not_advance_index_stamp(monkeypatch, refresh):
     cache_db.record_ccreport_indexed_at(100.0)
 
     def fail(*args, **kwargs):
@@ -344,7 +393,7 @@ def test_failed_scan_does_not_advance_index_stamp(monkeypatch):
 
     monkeypatch.setattr(scan, "save_ccreport_files", fail)
     with pytest.raises(OSError, match="write failed"):
-        scan._refresh_changed_files([], {})
+        refresh()
     assert cache_db.read_ccreport_indexed_at() == 100.0
 
 
@@ -365,4 +414,23 @@ def test_invalid_index_stamp_is_unknown(value):
     conn = cache_db.get_connection()
     conn.execute("INSERT INTO meta (key, value) VALUES ('ccreport_indexed_at', ?)", (value,))
     conn.commit()
+    assert cache_db.read_ccreport_indexed_at() is None
+
+
+@pytest.mark.parametrize(("age", "expected"), [
+    (None, True), (-100, False), (0, False), (86399, False), (86400, True), (172800, True),
+])
+def test_preview_staleness_threshold(monkeypatch, age, expected):
+    monkeypatch.setattr(startup.time, "time", lambda: 1_000_000.0)
+    if age is not None:
+        cache_db.record_ccreport_indexed_at(1_000_000.0 - age)
+    with startup.ReportRun() as run:
+        assert run.preview_due() is expected
+
+
+def test_raw_all_hit_scan_keeps_database_unchanged():
+    conn = cache_db.get_connection()
+    before = conn.total_changes
+    assert scan._refresh_changed_files([], {}) == ({}, set())
+    assert conn.total_changes == before
     assert cache_db.read_ccreport_indexed_at() is None

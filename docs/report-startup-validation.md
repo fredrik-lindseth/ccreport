@@ -10,6 +10,10 @@ copying, live log discovery/parsing and exchange-rate network calls are excluded
 The baseline prints only the final report; the saved-report mode also prints
 startup feedback and a matching, dated snapshot. The two modes were measured
 sequentially on the same frozen corpus with normal system load variation.
+These measurements exercise the snapshot path. The current UI takes that path
+only with an unknown or day-old index; a recent index shows just the final
+report and a transient status. The warm-cache rows describe cached records,
+not a recent index timestamp, and do not benchmark that staleness gate.
 
 | Scenario / metric | Final report only | With saved report |
 | --- | ---: | ---: |

@@ -2029,8 +2029,13 @@ report pipeline separately.
 
 ## 13. Interactive report startup and diagnostics
 
-A local terminal report prints feedback immediately and looks for a saved
-rendering in `report-preview.json` beside `cache.db`. A snapshot matches only
+A local terminal report shows a transient status while logs and exchange rates
+load. It looks for a saved rendering in `report-preview.json` beside `cache.db`
+only when the last completed index is unknown or at least 24 hours old
+(`startup.PREVIEW_STALE_AFTER_S`). Warm runs print a single report. When a
+snapshot is shown, the final report is labelled **Updated report**; otherwise
+it prints normally. The status disappears before the final report is rendered.
+A snapshot matches only
 the same CLI options (excluding `--debug`), enabled sources, installed package
 version, configuration file contents and terminal width.
 It is labelled cached with its save time and remains in scrollback while the
@@ -2054,10 +2059,14 @@ active phase stack and status; writes are best effort. Nested durations overlap,
 and exchange-rate prefetch overlaps corpus loading. Discovery, cache
 validation, changed-file parsing, record loading/rollups, rollup construction,
 exchange-rate wait/loading and rendering are measured separately. The shared
-`meta.ccreport_indexed_at` timestamp is written at the end of
-`scan._refresh_changed_files` after the final batch is saved, provided no file
-was unreadable. This covers report loaders, archive and detached pushes. A
-single SQLite upsert keeps the later completion time when processes overlap.
+`meta.ccreport_indexed_at` timestamp is written by `_load_full`,
+`_load_with_rollups` and `push.refresh_cache` after `_refresh_changed_files`
+returns, provided no file was unreadable. A rollup rebuild passes its refresh
+result into `_load_full`, so it stamps only once. The scanner source stays
+unchanged to preserve its parse fingerprint across this feature's upgrade.
+Even an all-hit report or push commits this one metadata write; cached files
+and records are untouched. A single SQLite upsert keeps the later completion
+time when processes overlap.
 Failed or cancelled scans leave the previous value intact. The age message
 reads this key after printing initial feedback; it never derives age from
 log mtimes or the diagnostic JSON. An empty but successfully indexed corpus

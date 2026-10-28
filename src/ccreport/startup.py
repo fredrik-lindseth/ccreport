@@ -20,6 +20,8 @@ from typing import Self
 
 from ccreport import cache_db
 
+PREVIEW_STALE_AFTER_S = 86400
+
 _active: ContextVar[ReportRun | None] = ContextVar("report_startup", default=None)
 
 
@@ -59,6 +61,11 @@ class ReportRun:
     def save(self) -> None:
         """Replace the previous diagnostic atomically; failures never block a report."""
         _write_json(self.path, self.data)
+
+    def preview_due(self) -> bool:
+        """Show provisional output only after an unknown or day-old index."""
+        stamp = cache_db.read_ccreport_indexed_at()
+        return stamp is None or time.time() - stamp >= PREVIEW_STALE_AFTER_S
 
     def age_message(self) -> str:
         stamp = cache_db.read_ccreport_indexed_at()
