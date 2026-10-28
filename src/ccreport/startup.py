@@ -30,16 +30,9 @@ class ReportRun:
         self.started = time.perf_counter()
         self.data: dict = {
             "started_at": time.time(), "status": "running", "phases": {},
-            "counts": {}, "active_phases": [], "last_indexed_at": None,
+            "counts": {}, "active_phases": [],
         }
         self.token: Token | None = None
-        try:
-            previous = json.loads(self.path.read_text())
-            stamp = previous.get("last_indexed_at")
-            if isinstance(stamp, (float, int)) and 0 < stamp <= time.time():
-                self.data["last_indexed_at"] = stamp
-        except (OSError, ValueError, AttributeError):
-            pass
 
     def __enter__(self) -> Self:
         self.token = _active.set(self)
@@ -68,18 +61,14 @@ class ReportRun:
         _write_json(self.path, self.data)
 
     def age_message(self) -> str:
-        stamp = self.data["last_indexed_at"]
+        stamp = cache_db.read_ccreport_indexed_at()
         if stamp is None:
-            return "Last report index time is unknown; catching up may take a while."
+            return "Last index time is unknown; catching up may take a while."
         days = max(0, int((time.time() - stamp) / 86400))
         if days == 0:
-            return "Last report indexing completed less than a day ago."
+            return "Last indexing completed less than a day ago."
         unit = "day" if days == 1 else "days"
-        return f"Last report indexing completed {days} {unit} ago; catching up may take a while."
-
-    def indexing_completed(self) -> None:
-        self.data["last_indexed_at"] = time.time()
-        self.save()
+        return f"Last indexing completed {days} {unit} ago; catching up may take a while."
 
 
 @contextmanager
@@ -94,9 +83,10 @@ def phase(name: str) -> Iterator[None]:
     run.save()
     try:
         yield
+    except BaseException:
+        run.data.setdefault("stopped_phase", name)
+        raise
     finally:
-        if sys.exc_info()[0] is not None:
-            run.data.setdefault("stopped_phase", name)
         phases = run.data["phases"]
         phases[name] = round(phases.get(name, 0) + time.perf_counter() - started, 4)
         run.data["active_phases"].remove(name)
@@ -120,11 +110,11 @@ def _write_json(path: Path, data: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         # A saved report contains local project/account names, like cache.db.
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(descriptor, "w") as stream:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump(data, stream, ensure_ascii=False)
             stream.write("\n")
         temporary.replace(path)
-    except OSError:
+    except (OSError, UnicodeError):
         pass
     finally:
         try:
@@ -136,7 +126,11 @@ def _write_json(path: Path, data: dict) -> None:
 def save_preview(options: dict, text: str) -> None:
     """Keep one bounded, private snapshot of a successfully rendered report."""
     path = cache_db.DB_PATH.with_name("report-preview.json")
-    if len(text.encode()) > _PREVIEW_MAX_BYTES:
+    try:
+        text_size = len(text.encode("utf-8"))
+    except UnicodeError:
+        return
+    if text_size > _PREVIEW_MAX_BYTES:
         # Do not leave an older snapshot looking like the latest saved report.
         try:
             path.unlink(missing_ok=True)
@@ -154,13 +148,13 @@ def read_preview(options: dict) -> tuple[str, float] | None:
     try:
         if path.stat().st_size > _PREVIEW_MAX_BYTES * 2:
             return None
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         if data.get("schema") != _PREVIEW_SCHEMA or data.get("options") != options:
             return None
         text, stamp = data.get("text"), data.get("saved_at")
         if not isinstance(text, str) or not isinstance(stamp, (int, float)):
             return None
-        if not 0 < stamp <= time.time() or len(text.encode()) > _PREVIEW_MAX_BYTES:
+        if not 0 < stamp <= time.time() or len(text.encode("utf-8")) > _PREVIEW_MAX_BYTES:
             return None
         # Validate the timestamp before the CLI converts it on any platform.
         datetime.fromtimestamp(stamp, tz=UTC)

@@ -10,6 +10,7 @@ import hashlib
 import re
 import sqlite3
 import subprocess
+import time
 import warnings
 from datetime import UTC, datetime
 from functools import cache
@@ -25,6 +26,7 @@ from ccreport.cache_db import (
     init_ccreport_meta,
     invalidate_ccreport,
     load_ccreport_file_meta,
+    record_ccreport_indexed_at,
     save_ccreport_files,
 )
 from ccreport.pricing import extract_assistant_fields
@@ -492,6 +494,8 @@ def _refresh_changed_files(
             pending = []
             pending_turns = {}
     save_ccreport_files(pending, turns=pending_turns)
+    if not unreadable:
+        record_ccreport_indexed_at(time.time())
     return fresh, unreadable
 
 

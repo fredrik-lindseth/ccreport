@@ -3475,12 +3475,14 @@ def main() -> None:
         cmd_server_report(args)
         return
 
-    interactive = console.is_terminal and not bool(getattr(args, "json", False))
+    interactive = sys.stdout.isatty() and not bool(getattr(args, "json", False))
     with startup.ReportRun(debug=args.debug) as run:
-        _run_local_report(args, run, interactive=interactive)
+        result = _run_local_report(args, run, interactive=interactive)
+    if result:
+        sys.exit(result)
 
 
-def _run_local_report(args: argparse.Namespace, run: startup.ReportRun, *, interactive: bool) -> None:
+def _run_local_report(args: argparse.Namespace, run: startup.ReportRun, *, interactive: bool) -> int:
     mva = not args.no_mva
 
     since = parse_date(args.since) if args.since else None
@@ -3511,7 +3513,6 @@ def _run_local_report(args: argparse.Namespace, run: startup.ReportRun, *, inter
             tool_filter=args.tool,
         )
 
-    run.indexing_completed()
     startup.count("loaded_rows", len(records))
 
     # Local rows alone, always. -A merges the pulled tables below; without it
@@ -3531,7 +3532,7 @@ def _run_local_report(args: argparse.Namespace, run: startup.ReportRun, *, inter
     if not records:
         print("No usage records found.", file=sys.stderr)
         _print_import_diagnostics(import_notes)
-        sys.exit(1)
+        return 1
 
     # Bulk-load exchange rates for all records
     if interactive:
@@ -3546,7 +3547,7 @@ def _run_local_report(args: argparse.Namespace, run: startup.ReportRun, *, inter
         # API call, and a pulled row is a day of somebody else's.
         report_json(local, nok=nok)
         _print_import_diagnostics(import_notes)
-        return
+        return 0
 
     if interactive:
         console.print("\n[bold]Updated report[/bold]")
@@ -3554,6 +3555,7 @@ def _run_local_report(args: argparse.Namespace, run: startup.ReportRun, *, inter
         _render_and_save_report(args, records, local, remote, nok, save=interactive)
 
     _print_import_diagnostics(import_notes)
+    return 0
 
 
 def _render_local_report(
@@ -3635,7 +3637,14 @@ def _render_local_report(
 def _preview_options(args: argparse.Namespace) -> dict:
     # Exact options and layout only: a saved report must never answer a
     # different filter, merge policy, tool selection or terminal width.
+    from ccreport.update_check import installed_version
+
+    try:
+        config_hash = hashlib.sha256(project_identity.CONFIG_PATH.read_bytes()).hexdigest()
+    except OSError:
+        config_hash = None
     return {
+        "version": installed_version(), "config_hash": config_hash,
         "args": {key: value for key, value in vars(args).items() if key != "debug"},
         "width": console.width, "sources": sorted(sources.enabled_sources()),
     }
@@ -3648,7 +3657,7 @@ def _show_saved_report(args: argparse.Namespace) -> None:
         return
     text, stamp = saved
     when = datetime.fromtimestamp(stamp).astimezone().strftime("%Y-%m-%d %H:%M")
-    console.print(f"\n[bold]Cached report — saved {when}; awaiting updated information[/bold]")
+    console.print(f"\n[bold]Cached report (saved {when}; awaiting updated information)[/bold]")
     # Already laid out at this width. Avoid interpreting project names as
     # markup or turning URLs into links a second time.
     console.print(text, end="", markup=False, highlight=False, emoji=False, soft_wrap=True)

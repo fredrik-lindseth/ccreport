@@ -217,17 +217,24 @@ ccreport limits -w session                  # rate-limit window history
 ```
 
 Interactive local reports immediately explain that logs are being updated and
-give the number of days since the last completed report index when known.
-If a previous report was saved with the same options, enabled tools and
-terminal width, it appears as a dated **Cached report** while the refresh runs.
+give the number of days since the last completed index when known.
+If a previous report was saved with the same options, enabled tools, package
+version, configuration and terminal width, it appears as a dated **Cached report** while the refresh runs.
 The **Updated report** follows below it; both stay in terminal scrollback.
-The first run after upgrading has no saved report or known index timestamp.
-JSON and piped output contain only the final report.
+A package upgrade invalidates the saved report. Scanner upgrades can also
+require a one-time re-index of existing logs. Until the first completed index,
+the index timestamp is unknown.
+JSON and piped output contain only the final report, including when
+`FORCE_COLOR` is set.
+
+The index timestamp is shared in SQLite by reports, detached pushes and the
+other commands that scan logs. Completed scans advance it atomically; a failed
+or unreadable scan leaves it alone, and overlapping writers cannot move it back.
 
 `report-preview.json` beside `cache.db` holds one saved rendering, limited to
 1 MiB and written with mode 0600 because it contains report data. It is replaced
-after a successful interactive report. Changed options or terminal width skip
-the preview; reports larger than the limit are not saved. Showing this snapshot
+after a successful interactive report. Changed options, configuration, version
+or terminal width skip the preview; reports larger than the limit are not saved. Showing this snapshot
 requires no extra database scan, aggregation or network request. The dated
 preview can be stale until the updated report arrives.
 

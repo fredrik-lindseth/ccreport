@@ -2031,11 +2031,13 @@ report pipeline separately.
 
 A local terminal report prints feedback immediately and looks for a saved
 rendering in `report-preview.json` beside `cache.db`. A snapshot matches only
-the same CLI options (excluding `--debug`), enabled sources and terminal width.
+the same CLI options (excluding `--debug`), enabled sources, installed package
+version, configuration file contents and terminal width.
 It is labelled cached with its save time and remains in scrollback while the
 normal refresh runs. Missing, corrupt, incompatible or differently scoped
 snapshots are ignored. JSON and non-terminal stdout skip both preview and
-snapshot writes.
+snapshot writes. Terminal detection uses `sys.stdout.isatty()`, so `FORCE_COLOR`
+does not enable preview output in a pipe.
 
 The normal renderer emits its updated tables while Rich records that output;
 the plain text is saved only after the complete rendering succeeds. This adds
@@ -2051,9 +2053,18 @@ client database. It records the latest local report's phase durations, counts,
 active phase stack and status; writes are best effort. Nested durations overlap,
 and exchange-rate prefetch overlaps corpus loading. Discovery, cache
 validation, changed-file parsing, record loading/rollups, rollup construction,
-exchange-rate wait/loading and rendering are measured separately. The last
-completed report index timestamp moves only after `load_all_records` returns;
-a failed or cancelled index preserves the prior timestamp. This dates a report
-index, not a detached push or status-line refresh. Until first measured it is
-unknown rather than inferred from a session log's mtime. `--debug` echoes
-durations to stderr.
+exchange-rate wait/loading and rendering are measured separately. The shared
+`meta.ccreport_indexed_at` timestamp is written at the end of
+`scan._refresh_changed_files` after the final batch is saved, provided no file
+was unreadable. This covers report loaders, archive and detached pushes. A
+single SQLite upsert keeps the later completion time when processes overlap.
+Failed or cancelled scans leave the previous value intact. The age message
+reads this key after printing initial feedback; it never derives age from
+log mtimes or the diagnostic JSON. An empty but successfully indexed corpus
+still records a completed diagnostic run, while the CLI returns exit status 1.
+
+Both the saved report and diagnostic JSON use explicit UTF-8 encoding. A phase
+is marked stopped only when an exception leaves that phase; an outer exception
+already under handling does not mark a successful phase as stopped. Until the
+first completed scan, the index time is unknown. `--debug` echoes durations to
+stderr.

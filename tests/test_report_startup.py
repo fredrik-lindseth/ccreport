@@ -3,12 +3,15 @@
 import argparse
 import io
 import json
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime
 
 import pytest
 from rich.console import Console
 
-from ccreport import aggregate, cache_db, startup
+from ccreport import aggregate, cache_db, scan, startup, update_check
 from ccreport import ccreport as ccr
 
 
@@ -43,6 +46,7 @@ def test_preview_is_visible_before_refresh_and_pipes_stay_clean(monkeypatch, int
     output = io.StringIO()
     monkeypatch.setattr(ccr, "console", Console(file=output, force_terminal=interactive, color_system=None))
     monkeypatch.setattr(ccr.sys, "argv", ["ccreport", "--json"] if as_json else ["ccreport"])
+    monkeypatch.setattr(ccr.sys.stdout, "isatty", lambda: interactive)
     monkeypatch.setattr(ccr.exchange, "start_prefetch", lambda: None)
     monkeypatch.setattr(startup, "read_preview", lambda options: ("SPEND 1.0\n", 1_000_000.0))
     monkeypatch.setattr(ccr, "_remote_records", lambda *args: ccr.RemoteSpend([], set()))
@@ -86,6 +90,7 @@ def test_empty_preview_does_not_prevent_first_index(monkeypatch):
     output = io.StringIO()
     monkeypatch.setattr(ccr, "console", Console(file=output, force_terminal=True, color_system=None))
     monkeypatch.setattr(ccr.sys, "argv", ["ccreport"])
+    monkeypatch.setattr(ccr.sys.stdout, "isatty", lambda: True)
     monkeypatch.setattr(ccr, "discover_jsonl_files", list)
     monkeypatch.setattr(ccr.exchange, "start_prefetch", lambda: None)
     with pytest.raises(SystemExit) as exc:
@@ -93,7 +98,8 @@ def test_empty_preview_does_not_prevent_first_index(monkeypatch):
     assert exc.value.code == 1
     assert "No saved report for these options yet" in output.getvalue()
     data = json.loads(cache_db.DB_PATH.with_name("startup-timings.json").read_text())
-    assert data["last_indexed_at"] is not None
+    assert cache_db.read_ccreport_indexed_at() is not None
+    assert data["status"] == "complete"
     assert data["counts"]["discovered_files"] == 0
     assert data["phases"]["discovery"] >= 0
 
@@ -102,7 +108,7 @@ def test_diagnostics_keep_age_after_interrupt_and_replace_previous_run(monkeypat
     monkeypatch.setattr(startup.time, "time", lambda: 1_000_000.0)
     with startup.ReportRun() as first:
         assert "unknown" in first.age_message()
-        first.indexing_completed()
+        cache_db.record_ccreport_indexed_at(1_000_000.0)
         with startup.phase("discovery"):
             startup.count("discovered_files", 12)
     monkeypatch.setattr(startup.time, "time", lambda: 1_000_000.0 + 7 * 86400)
@@ -116,7 +122,7 @@ def test_diagnostics_keep_age_after_interrupt_and_replace_previous_run(monkeypat
     data = json.loads(interrupted.path.read_text())
     assert data["status"] == "interrupted"
     assert data["stopped_phase"] == "discovery"
-    assert data["last_indexed_at"] == 1_000_000.0
+    assert cache_db.read_ccreport_indexed_at() == 1_000_000.0
     assert data["counts"] == {}
     assert data["active_phases"] == []
     with startup.ReportRun() as last:
@@ -139,7 +145,6 @@ def test_diagnostics_write_failure_does_not_fail_report(monkeypatch):
     monkeypatch.setattr(cache_db, "DB_PATH", cache_db.DB_PATH.parent / "blocked" / "cache.db")
     with startup.ReportRun() as run, startup.phase("discovery"):
         startup.count("discovered_files", 3)
-        run.indexing_completed()
     assert run.data["status"] == "complete"
 
 
@@ -213,3 +218,151 @@ def test_source_policy_change_skips_saved_report(monkeypatch):
     startup.save_preview(ccr._preview_options(args), "includes Codex")
     monkeypatch.setattr(ccr.sources, "enabled_sources", lambda: frozenset({"claude"}))
     assert startup.read_preview(ccr._preview_options(args)) is None
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_force_color_does_not_enable_interactive_output_in_pipe(monkeypatch, as_json):
+    output = io.StringIO()
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setattr(ccr, "console", Console(file=output, color_system=None))
+    assert ccr.console.is_terminal
+    monkeypatch.setattr(ccr.sys.stdout, "isatty", lambda: False)
+    monkeypatch.setattr(ccr.sys, "argv", ["ccreport", "--json"] if as_json else ["ccreport"])
+    monkeypatch.setattr(ccr.exchange, "start_prefetch", lambda: None)
+    monkeypatch.setattr(ccr, "load_all_records", lambda **kw: [_record()])
+    monkeypatch.setattr(ccr, "_remote_records", lambda *a: ccr.RemoteSpend([], set()))
+    monkeypatch.setattr(ccr, "load_rates_for_records", lambda *a, **kw: (aggregate.NokCtx(), True))
+    monkeypatch.setattr(ccr, "_render_local_report", lambda *a: ccr.console.print("REPORT"))
+    monkeypatch.setattr(ccr, "report_json", lambda *a, **kw: ccr.console.print("[]"))
+
+    def forbidden(*a):
+        pytest.fail("a pipe must not read or write a preview")
+
+    monkeypatch.setattr(startup, "read_preview", forbidden)
+    monkeypatch.setattr(startup, "save_preview", forbidden)
+    ccr.main()
+    assert output.getvalue() == ("[]\n" if as_json else "REPORT\n")
+
+
+def test_successful_phase_inside_handled_exception_is_not_stopped():
+    with startup.ReportRun() as run:
+        try:
+            raise ValueError("handled")
+        except ValueError:
+            with startup.phase("successful"):
+                pass
+    assert run.data["status"] == "complete"
+    assert "stopped_phase" not in run.data
+    assert "successful" in run.data["phases"]
+
+
+def test_snapshot_invalidated_by_upgrade_or_config_change(monkeypatch):
+    args = argparse.Namespace(command=None, tool=None, all=False, debug=False)
+    monkeypatch.setattr(update_check, "installed_version", lambda: "1.0")
+    original = ccr._preview_options(args)
+    startup.save_preview(original, "old report")
+    monkeypatch.setattr(update_check, "installed_version", lambda: "1.1")
+    assert startup.read_preview(ccr._preview_options(args)) is None
+    monkeypatch.setattr(update_check, "installed_version", lambda: "1.0")
+    from ccreport import project_identity
+    project_identity.CONFIG_PATH.write_text('repo_roots = ["/work"]\n', encoding="utf-8")
+    assert startup.read_preview(ccr._preview_options(args)) is None
+
+
+def test_preview_and_diagnostics_use_utf8_in_ascii_locale(tmp_path):
+    script = r"""
+import locale
+import sys
+from pathlib import Path
+from ccreport import cache_db, startup
+assert not sys.flags.utf8_mode
+assert locale.getencoding().lower() not in ('utf-8', 'utf8')
+cache_db.DB_PATH = Path(sys.argv[1]) / 'cache.db'
+text = 'bl\u00e5b\u00e6r \u00c6\u00d8\u00c5 \u2502'
+startup.save_preview({'name': text}, text)
+saved = startup.read_preview({'name': text})
+assert saved is not None and saved[0] == text
+with startup.ReportRun() as run:
+    run.data['test_unicode'] = text
+print('ok')
+"""
+    env = dict(os.environ, LC_ALL="C", LANG="C", PYTHONUTF8="0", PYTHONCOERCECLOCALE="0")
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)], env=env, capture_output=True, text=True, check=True,
+    )
+    assert result.stdout == "ok\n"
+    data = json.loads((tmp_path / "startup-timings.json").read_text(encoding="utf-8"))
+    assert data["test_unicode"] == "blåbær ÆØÅ │"
+
+
+def test_unencodable_preview_does_not_fail_report():
+    startup.save_preview({}, "valid")
+    startup.save_preview({}, "invalid \ud800")
+    saved = startup.read_preview({})
+    assert saved is not None
+    assert saved[0] == "valid"
+
+
+def test_index_stamp_is_shared_by_detached_push_and_reports(monkeypatch):
+    monkeypatch.setattr(scan, "discover_jsonl_files", list)
+    monkeypatch.setattr(ccr, "discover_jsonl_files", list)
+    monkeypatch.setattr(scan.time, "time", lambda: 100.0)
+    from ccreport import push
+    push.refresh_cache()
+    assert cache_db.read_ccreport_indexed_at() == 100.0
+    monkeypatch.setattr(scan.time, "time", lambda: 200.0)
+    assert ccr.load_all_records() == []
+    assert cache_db.read_ccreport_indexed_at() == 200.0
+    with startup.ReportRun() as run:
+        assert "less than a day" in run.age_message()
+
+
+def test_index_stamp_cannot_move_back_between_connections():
+    import sqlite3
+    cache_db.record_ccreport_indexed_at(200.0)
+    # Another process's later stamp arrives before an older writer commits.
+    with sqlite3.connect(cache_db.DB_PATH) as other:
+        other.execute("UPDATE meta SET value = '300.0' WHERE key = 'ccreport_indexed_at'")
+    cache_db.record_ccreport_indexed_at(100.0)
+    assert cache_db.read_ccreport_indexed_at() == 300.0
+
+
+def test_incomplete_scan_does_not_advance_index_stamp(monkeypatch, tmp_path):
+    cache_db.record_ccreport_indexed_at(100.0)
+    monkeypatch.setattr(scan, "parse_jsonl", lambda p: (_ for _ in ()).throw(OSError("unreadable")))
+    path = tmp_path / "session.jsonl"
+    path.write_text("{}", encoding="utf-8")
+    scan._refresh_changed_files([path], {})
+    assert cache_db.read_ccreport_indexed_at() == 100.0
+
+
+def test_failed_scan_does_not_advance_index_stamp(monkeypatch):
+    cache_db.record_ccreport_indexed_at(100.0)
+
+    def fail(*args, **kwargs):
+        raise OSError("write failed")
+
+    monkeypatch.setattr(scan, "save_ccreport_files", fail)
+    with pytest.raises(OSError, match="write failed"):
+        scan._refresh_changed_files([], {})
+    assert cache_db.read_ccreport_indexed_at() == 100.0
+
+
+def test_unencodable_diagnostics_do_not_fail_report():
+    with startup.ReportRun() as run:
+        run.data["invalid_unicode"] = "\ud800"
+    assert run.data["status"] == "complete"
+    assert not list(run.path.parent.glob("startup-timings.*.tmp"))
+
+
+def test_invalid_utf8_preview_is_ignored():
+    cache_db.DB_PATH.with_name("report-preview.json").write_bytes(b"\xff")
+    assert startup.read_preview({}) is None
+
+
+@pytest.mark.parametrize("value", ["bad", "nan", "inf", "-1", "0"])
+def test_invalid_index_stamp_is_unknown(value):
+    conn = cache_db.get_connection()
+    conn.execute("INSERT INTO meta (key, value) VALUES ('ccreport_indexed_at', ?)", (value,))
+    conn.commit()
+    assert cache_db.read_ccreport_indexed_at() is None
